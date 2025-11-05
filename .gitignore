@@ -47,3 +47,6 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+*.csv
+*.txt
+shinycannon-1.2.0-85f280d.jar
