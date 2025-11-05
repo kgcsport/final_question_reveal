@@ -2,7 +2,10 @@ if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(shiny, DT, bcrypt, tidyverse)
 
 # Load credentials once (CSV created above). Put it next to app.R or give an absolute path.
-CRED <- read_csv("credentials.csv")
+# CRED <- read_csv("credentials.csv")
+cred_b64 <- Sys.getenv("CRED_B64")
+cred_txt <- rawToChar(base64enc::base64decode(cred_b64))
+CRED <- read_csv(cred_txt)
 
 `%||%` <- function(a, b) {
   if (!is.null(a) && !is.na(a) && nzchar(as.character(a))) a else b
