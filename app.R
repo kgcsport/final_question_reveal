@@ -201,7 +201,6 @@ server <- function(input, output, session) {
             next_round <- max_round + 1L
             # Bound to available questions if necessary
             G$round <- if (next_round > length(QUESTIONS)) length(QUESTIONS) else next_round
-            G$question_text <- as.character(QUESTIONS[[G$round]])
             updateSelectInput(session, "round_selector", selected = G$round)
             updateTextAreaInput(session, "admin_question", value = title_from_html(G$question_text))
             showNotification(sprintf("Current round set to %d after pledges upload.", G$round), type = "message")
@@ -553,7 +552,7 @@ server <- function(input, output, session) {
             p("Once the class total meets the cost, the question will appear here.")
           )
         )
-      } else if (G$question_unlocked) {
+      } else if (G$unlocked_units > 0) {
         tagList(
           p("Pledging is CLOSED."),
           h5("Unlocked Questions"),
@@ -885,8 +884,11 @@ server <- function(input, output, session) {
     units_now <- as.integer(floor(total_available / G$COST))
     spend_now <- units_now * G$COST
 
-    # Update cumulative unlocked
+    # Determine if there were new purchases this round
+    new_purchases <- units_now > 0
+    unlocked_before <- as.integer(G$unlocked_units)
     G$unlocked_units <- G$unlocked_units + units_now
+    unlocked_after <- as.integer(G$unlocked_units)
 
     # ====== CHARGING LOGIC ======
     if (length(idxr)) {
@@ -921,13 +923,11 @@ server <- function(input, output, session) {
     # We spend 'spend_now' on questions. Remainder carries forward.
     G$carryover <- total_available - spend_now
 
-    # ====== REVEAL QUESTIONS (if any purchased) ======
-    if (units_now > 0) {
+    # ====== REVEAL QUESTIONS (show all purchased so far, even if no new purchases) ======
+    start_idx <- as.integer(input$round_selector %||% G$round %||% 1L)
+    k <- length(QUESTIONS)
+    if (G$unlocked_units > 0) {
       G$question_unlocked <- TRUE
-
-      start_idx <- as.integer(input$round_selector %||% G$round %||% 1L)
-      k <- length(QUESTIONS)
-
       # show the cumulative pool on projector (most recent first)
       reveal_idx <- ((start_idx - 1L + seq_len(G$unlocked_units) - 1L) %% k) + 1L
       G$revealed_html <- rev(vapply(
@@ -936,25 +936,40 @@ server <- function(input, output, session) {
         "",
         USE.NAMES = FALSE
       ))
-
-      # For the student panel, show the first newly purchased one this round
-      new_idxs <- ((start_idx - 1L + seq_len(units_now) - 1L) %% k) + 1L
-      G$question_text <- as.character(QUESTIONS[[new_idxs[1]]])
-
-      showNotification(
-        sprintf("Purchased %g question(s). New carryover: %.2f.", units_now, G$carryover),
-        type = "message"
-      )
+      # For the student panel, just keep showing the most recently purchased one as main question_text (or fallback)
+      if (new_purchases) {
+        new_idxs <- ((start_idx - 1L + seq_len(unlocked_after - unlocked_before) + unlocked_before - 1L) %% k) + 1L
+        G$question_text <- as.character(QUESTIONS[[new_idxs[1]]])
+      } else {
+        # If no new questions bought, leave question_text unchanged (don't confuse users)
+        # Alternatively, could show last unlocked question, e.g.:
+        last_idx <- ((start_idx - 1L + unlocked_after - 1L) %% k) + 1L
+        G$question_text <- as.character(QUESTIONS[[last_idx]])
+      }
+      if (new_purchases) {
+        showNotification(
+          sprintf("Purchased %g question(s). New carryover: %.2f.", units_now, G$carryover),
+          type = "message"
+        )
+      } else {
+        if (identical(G$SHORTFALL_POLICY, "bank_all")) {
+          showNotification(
+            sprintf("Not funded — pledges banked. New carryover: %.2f. At game over, carryover will be refunded proportionally.", G$carryover),
+            type = "warning"
+          )
+        } else {
+          showNotification("Not funded — no one charged; no carryover added.", type = "warning")
+        }
+      }
     } else {
-      # No purchases this close
+      G$question_unlocked <- FALSE
+      G$revealed_html <- character()
       if (identical(G$SHORTFALL_POLICY, "bank_all")) {
-        # Bank pledges (already charged above) into carryover
         showNotification(
           sprintf("Not funded — pledges banked. New carryover: %.2f. At game over, carryover will be refunded proportionally.", G$carryover),
           type = "warning"
         )
       } else {
-        # nocharge branch (unfunded): everyone charged 0 and nothing added to carryover
         showNotification("Not funded — no one charged; no carryover added.", type = "warning")
       }
     }
