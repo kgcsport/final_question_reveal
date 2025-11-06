@@ -26,6 +26,7 @@ QUESTIONS <- list(
 )
 
 # ===== UI HELPERS =====
+
 logged_in_ui <- function() {
   fluidPage(
     titlePanel("Buy Potential Exam Questions (Public Goods Game)"),
@@ -47,6 +48,13 @@ login_ui <- function(msg = NULL) {
     tags$small("Use the username and password provided by your instructor.")
   )
 }
+
+# FILE UPLOAD UI for pledges (for admins)
+admin_pledges_upload_ui <- wellPanel(
+  h5("Upload prior pledges (CSV)"),
+  fileInput("upload_pledges", "Choose pledges.csv", accept = ".csv"),
+  uiOutput("upload_pledges_status")
+)
 
 ui <- fluidPage(
   # login gate
@@ -77,10 +85,10 @@ server <- function(input, output, session) {
     authed   = FALSE,
     user     = NULL,
     display  = NULL,
-    is_admin = FALSE
+    is_admin = FALSE,
+    my_submission_pulse = 0L # Bump this to update my_submissions DT for THIS session
   )
 
-    
   # --- Admin/projector summary (recompute only on admin pulses) ---
   wtp_summary <- eventReactive(rv$admin_pulse, {
     idxr <- which(G$pledges$round == G$round)
@@ -96,7 +104,6 @@ server <- function(input, output, session) {
     )
   }, ignoreInit = FALSE)
 
-  
   output$authed   <- reactive(rv$authed)
   output$is_admin <- reactive(isTRUE(rv$is_admin))
   outputOptions(output, "authed",   suspendWhenHidden = FALSE)
@@ -152,12 +159,69 @@ server <- function(input, output, session) {
     )
   }
 
+  # ==== PLEDGES.CSV UPLOAD FOR ADMIN ====
+
+  # UI: Show upload control in admin panel only
+  output$upload_pledges_status <- renderUI({
+    if (!isTRUE(is_admin())) return(NULL)
+    if (!is.null(input$upload_pledges)) {
+      tags$span(style="color:green;", paste0("Imported: ", input$upload_pledges$name))
+    }
+  })
+
+  # UI helper for insert into admin_controls
+  admin_pledges_upload_ui_reactive <- reactive({
+    req(isTRUE(authed()), isTRUE(is_admin()))
+    admin_pledges_upload_ui
+  })
+
+  # Import pledges.csv
+  observeEvent(input$upload_pledges, {
+    req(isTRUE(is_admin()))
+    fileinfo <- input$upload_pledges
+    ext <- tools::file_ext(fileinfo$datapath)
+    if (tolower(ext) == "csv") {
+      pledges_df <- tryCatch(
+        readr::read_csv(fileinfo$datapath, show_col_types = FALSE),
+        error = function(e) NULL
+      )
+      if (!is.null(pledges_df) &&
+          all(c("round", "user_id", "name", "pledge", "charged", "when") %in% names(pledges_df))) {
+        print(sum(pledges_df$pledge, na.rm = TRUE))
+        G$pledges <- as_tibble(pledges_df) %>%
+          mutate(when = as.character(when))
+        
+        # After import, set round = 1 + max(round) in CSV
+        if (nrow(G$pledges) > 0 && !all(is.na(G$pledges$round))) {
+          max_round <- suppressWarnings(max(G$pledges$round, na.rm = TRUE))
+          total_available <- G$carryover + sum(G$pledges$pledge, na.rm = TRUE)
+          G$unlocked_units <- as.integer(floor(total_available / G$COST))
+          G$carryover <- total_available - G$unlocked_units * G$COST
+          if (!is.na(max_round) && is.finite(max_round)) {
+            next_round <- max_round + 1L
+            # Bound to available questions if necessary
+            G$round <- if (next_round > length(QUESTIONS)) length(QUESTIONS) else next_round
+            G$question_text <- as.character(QUESTIONS[[G$round]])
+            updateSelectInput(session, "round_selector", selected = G$round)
+            updateTextAreaInput(session, "admin_question", value = title_from_html(G$question_text))
+            showNotification(sprintf("Current round set to %d after pledges upload.", G$round), type = "message")
+          }
+        }
+        showNotification("Prior pledges uploaded and set.", type = "message")
+        bump_admin()
+      } else {
+        showNotification("Failed to upload: required columns missing.", type = "error")
+      }
+    } else {
+      showNotification("Please upload a CSV file.", type = "error")
+    }
+  })
+
   # ---- auth ----
   observeEvent(input$login_btn, {
     u <- trimws(input$login_user)
     p <- input$login_pw
     row <- CRED[CRED$user == u, , drop = FALSE]
-
     ok <- nrow(row) == 1 && bcrypt::checkpw(p, row$pw_hash)
 
     if (ok) {
@@ -197,7 +261,7 @@ server <- function(input, output, session) {
 
   # ==== DOWNLOAD HANDLERS ====
   output$dl_roster_csv <- downloadHandler(
-    filename = function() "roster.csv",
+    filename = function() "roster_players.csv",
     content = function(file) readr::write_csv(G$roster, file)
   )
 
@@ -213,14 +277,14 @@ server <- function(input, output, session) {
     content = function(file) {
       tmpdir <- tempdir()
       pledges_path <- file.path(tmpdir, "pledges.csv")
-      roster_path  <- file.path(tmpdir, "roster.csv")
+      roster_path  <- file.path(tmpdir, "roster_players.csv")
 
       readr::write_csv(G$pledges, pledges_path)
       readr::write_csv(G$roster,  roster_path)
 
       oldwd <- setwd(tmpdir)
       on.exit(setwd(oldwd), add = TRUE)
-      utils::zip(zipfile = file, files = c("pledges.csv", "roster.csv"))
+      utils::zip(zipfile = file, files = c("pledges.csv", "roster_players.csv"))
     }
   )
 
@@ -240,6 +304,33 @@ server <- function(input, output, session) {
   })
 
   # ---- STUDENT UI ----
+  # Show pledge history table for this student after submitting a pledge (using my_submission_pulse)
+  output$my_history_table <- renderUI({
+    req(isTRUE(authed()))
+    uid <- user_id()
+    # Show all prior rounds where user had a pledge (sorted by round ascending)
+    # Only show when a pledge has been submitted in this session (tracked by rv$my_submission_pulse)
+    isolate({
+      if (rv$my_submission_pulse > 0) {
+        user_pledges <- dplyr::filter(G$pledges, .data$user_id == uid)
+        user_pledges <- user_pledges |>
+          dplyr::arrange(round) |>
+          dplyr::select(Round = round, Pledge = pledge, Charged = charged, Submitted = when)
+        if (nrow(user_pledges) == 0) {
+          div()
+        } else {
+          tags$div(
+            style="margin-top:10px;",
+            h5("Your prior round pledges:"),
+            DT::renderDataTable({
+              DT::datatable(user_pledges, rownames = FALSE, options = list(pageLength=10, searching=FALSE, lengthChange=FALSE, ordering=TRUE))
+            })()
+          )
+        }
+      }
+    })
+  })
+
   student_ui <- fluidPage(
     h4(textOutput("round_title")),
     uiOutput("game_rules"),
@@ -256,7 +347,9 @@ server <- function(input, output, session) {
     uiOutput("progress_text"),
     tags$hr(),
     h5("Your submissions"),
-    DTOutput("my_submissions")
+    DTOutput("my_submissions"),
+    # Display user's prior round history table (only after submitting at least one pledge this session)
+    uiOutput("my_history_table")
   )
 
   output$student_ui <- renderUI({
@@ -402,6 +495,7 @@ server <- function(input, output, session) {
         column(3, actionButton("reset_all",   "RESET all (keep roster)", class = "btn-outline-danger")),
         column(3, actionButton("end_game", "End game & redistribute", class="btn-warning"))
       ),
+      admin_pledges_upload_ui_reactive(),   # Add file upload UI to admin panel!
       h5(textOutput("admin_round_title")),
       verbatimTextOutput("admin_round_status"),
       tags$hr(),
@@ -434,7 +528,7 @@ server <- function(input, output, session) {
     sprintf("Round %g — Cost to unlock: %g points", G$round, G$COST)
   })
 
-    output$game_rules <- renderUI({
+  output$game_rules <- renderUI({
     HTML(sprintf(
         "<ol style='margin-left: 1.2em; line-height: 1.4;'>
         <li>Each student starts with <b>%g points</b> they can pledge toward unlocking potential final exam questions.</li>
@@ -447,8 +541,7 @@ server <- function(input, output, session) {
         </ol>",
         G$MAX_PER_STUDENT, G$COST
     ))
-    })
-
+  })
 
   output$round_status <- renderUI({
     tagList(
@@ -491,16 +584,14 @@ server <- function(input, output, session) {
   })
 
   # ====== PLEDGE SUBMISSION LOGIC ======
-
   rv$round_pulse <- 0L
-  # bump_round() should be called at the end of close_round and next_round
   bump_round <- function() rv$round_pulse <<- rv$round_pulse + 1L
 
   # add bump_round() at the end of your input$close_round and input$next_round observers
 
   output$pledge_ui <- renderUI({
     rv$round_pulse   # <- only recompute when round ends/changes
-  
+
     # cap logic: admins get their own cap; students get "remaining_cap"
     if (is_admin()) {
       cap <- G$MAX_FOR_ADMIN
@@ -542,7 +633,6 @@ server <- function(input, output, session) {
     } else {
       showNotification(sprintf("Pledge of %g points submitted successfully.", input$pledge), type = "message")
     }
-
 
     uid  <- user_id()
     disp <- dispname()
@@ -590,6 +680,7 @@ server <- function(input, output, session) {
       }
     }
 
+    rv$my_submission_pulse <- rv$my_submission_pulse + 1L  # Bump to trigger history table update for current user session
     bump_admin()
   })
 
@@ -868,7 +959,7 @@ server <- function(input, output, session) {
       }
     }
     bump_admin()
-})
+  })
 
 
   observeEvent(input$next_round, ignoreInit = TRUE, {
