@@ -623,7 +623,6 @@ server <- function(input, output, session) {
     bump_admin()
   })
 
-
   output$admin_round_title <- renderText({
     st <- current_state(); s <- current_settings()
     sprintf("Round %g — Cost: %g points", st$round, s$cost)
@@ -707,13 +706,19 @@ server <- function(input, output, session) {
   })
 
   output$wtp_hist <- renderPlot({
-    df <- round_df(); s <- current_settings()
-    ggplot2::ggplot(df, ggplot2::aes(x = pledge)) +
-      ggplot2::geom_histogram(binwidth = s$slider_step, boundary = 0, closed = "left") +
+    # df <- round_df() 
+    st <- current_state()
+    df <- DBI::dbGetQuery(db, "SELECT pledge, round FROM pledges WHERE round <= ?;", params = list(st$round))
+    s <- current_settings()
+    
+    ggplot2::ggplot(df, ggplot2::aes(x = pledge,fill=as.factor(round))) +
+      ggplot2::geom_histogram(binwidth = s$slider_step, boundary = 0, closed = "left",position='dodge') +
       ggplot2::scale_x_continuous(limits = c(0, s$max_per_student),
                                   breaks = seq(0, s$max_per_student, by = s$slider_step)) +
-      ggplot2::labs(x = "Pledge (WTP)", y = "Count") +
-      ggplot2::theme_bw()
+      scale_fill_brewer(palette="Set2") +
+      ggplot2::labs(x = "Pledge (WTP)", y = "Count", fill="Round") +
+      ggplot2::theme_bw() +
+      ggplot2::theme(legend.position = if(st$round>1) "bottom" else "none")
   })
 
   output$projector_question <- renderUI({
