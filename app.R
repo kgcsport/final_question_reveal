@@ -15,7 +15,7 @@ if (!nzchar(cred_b64)) {
   stop("CRED_B64 env var is empty. Set base64-encoded CSV with columns: name,user,is_admin,pw_hash")
 }
 cred_txt <- rawToChar(base64enc::base64decode(cred_b64))
-CRED <- readr::read_csv(cred_txt, show_col_types = FALSE)
+CRED <- readr::read_csv(readr::I(cred_txt), show_col_types = FALSE)
 
 # -------------------------
 # Questions (unchanged)
@@ -48,16 +48,19 @@ title_from_html <- function(x) {
 # SQLite connection + schema (HARDENED)
 # -------------------------
 
-# FIX: choose a guaranteed-writable path on Connect/shinyapps
 safe_data_dir <- function() {
-  # Prefer a user/app data dir, else fall back to tempdir()
-  d <- tryCatch(tools::R_user_dir("finalquestion", "data"), error = function(e) "")
-  if (!nzchar(d)) d <- file.path(tempdir(), "finalquestion")
+  d <- Sys.getenv("CONNECT_CONTENT_DIR", "")
+  if (nzchar(d)) {
+    d <- file.path(d, "data")
+  } else {
+    d <- tryCatch(tools::R_user_dir("finalquestion", "data"), error = function(e) "")
+    if (!nzchar(d)) d <- file.path(tempdir(), "finalquestion")
+  }
   if (!dir.exists(d)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
   d
 }
 
-db_path <- Sys.getenv("APP_DB_PATH", file.path(safe_data_dir(), "appdata.sqlite"))  # FIX
+db_path <- Sys.getenv("APP_DB_PATH", file.path(safe_data_dir(), "appdata.sqlite"))
 db <- pool::dbPool(RSQLite::SQLite(), dbname = db_path)
 
 # FIX: reliability PRAGMAs
