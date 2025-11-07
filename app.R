@@ -7,15 +7,63 @@ pacman::p_load(shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue
 
 `%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(as.character(a))) a else b
 
+options(shiny.sanitize.errors = FALSE)
+options(shiny.fullstacktrace = TRUE)
+
+# Log helper: writes to stderr (shows in Connect logs)
+logf <- function(...) cat(format(Sys.time()), "-", paste(..., collapse=" "), "\n", file=stderr())
+
+logf("getwd:", getwd())
+logf("files:", paste(list.files(all.files = TRUE), collapse = ", "))
+
+env_vars <- c("CRED_B64", "CRED_PATH", "CRED_CSV")
+vals <- Sys.getenv(env_vars, unset = "")
+logf("env present:", paste(env_vars, nzchar(vals), sep="=", collapse="; "))
+
+# For debugging only: log lengths, not contents
+logf("CRED_B64 nchar:", nchar(Sys.getenv("CRED_B64", "")))
+logf("CRED_CSV nchar:", nchar(Sys.getenv("CRED_CSV", "")))
+logf("CRED_PATH:", Sys.getenv("CRED_PATH", ""))
+
 # -------------------------
 # Credentials (unchanged-ish, but with better errors)
 # -------------------------
-cred_b64 <- Sys.getenv("CRED_B64", "")
-if (!nzchar(cred_b64)) {
-  stop("CRED_B64 env var is empty. Set base64-encoded CSV with columns: name,user,is_admin,pw_hash")
+# cred_b64 <- Sys.getenv("CRED_B64", "")
+# if (!nzchar(cred_b64)) {
+#   stop("CRED_B64 env var is empty. Set base64-encoded CSV with columns: name,user,is_admin,pw_hash")
+# }
+# cred_txt <- rawToChar(base64enc::base64decode(cred_b64))
+# CRED <- readr::read_csv(readr::I(cred_txt), show_col_types = FALSE)
+
+library(readr)
+library(base64enc)
+
+get_credentials <- function() {
+  b64 <- Sys.getenv("CRED_B64", "")
+  if (nzchar(b64)) {
+    logf("Loading credentials from CRED_B64")
+    raw <- base64decode(b64)
+    return(read_csv(rawW, show_col_types = FALSE, trim_ws = TRUE))
+  }
+  csv <- Sys.getenv("CRED_CSV", "")
+  if (nzchar(csv)) {
+    logf("Loading credentials from CRED_CSV")
+    con <- textConnection(csv); on.exit(close(con))
+    return(read_csv(con, show_col_types = FALSE, trim_ws = TRUE))
+  }
+  path <- Sys.getenv("CRED_PATH", "")
+  if (nzchar(path)) {
+    logf("Loading credentials from CRED_PATH:", path)
+    stopifnot(file.exists(path))
+    return(read_csv(path, show_col_types = FALSE, trim_ws = TRUE))
+  }
+  stop("No credentials found: set CRED_B64 (preferred), or CRED_CSV, or CRED_PATH")
 }
-cred_txt <- rawToChar(base64enc::base64decode(cred_b64))
-CRED <- readr::read_csv(readr::I(cred_txt), show_col_types = FALSE)
+
+CRED <- tryCatch(
+  get_credentials(),
+  error = function(e) { logf("Credential load error:", conditionMessage(e)); stop(e) }
+)
 
 # -------------------------
 # Questions (unchanged)
