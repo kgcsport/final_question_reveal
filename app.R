@@ -107,8 +107,7 @@ safe_data_dir <- function() {
   d
 }
 
-db_path <- Sys.getenv("APP_DB_PATH") #Sys.getenv("APP_DB_PATH", file.path(safe_data_dir(), "appdata.sqlite"))
-logf("db_path:", db_path)
+db_path <- file.path(safe_data_dir(), "appdata.sqlite")
 db <- pool::dbPool(RSQLite::SQLite(), dbname = db_path)
 
 # FIX: reliability PRAGMAs
