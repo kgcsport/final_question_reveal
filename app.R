@@ -14,7 +14,6 @@ options(shiny.fullstacktrace = TRUE)
 logf <- function(...) cat(format(Sys.time()), "-", paste(..., collapse=" "), "\n", file=stderr())
 
 logf("getwd:", getwd())
-logf("files:", paste(list.files(all.files = TRUE), collapse = ", "))
 
 env_vars <- c("CRED_B64", "CRED_PATH", "CRED_CSV")
 vals <- Sys.getenv(env_vars, unset = "")
@@ -43,7 +42,7 @@ get_credentials <- function() {
   if (nzchar(b64)) {
     logf("Loading credentials from CRED_B64")
     raw <- base64decode(b64)
-    return(read_csv(rawW, show_col_types = FALSE, trim_ws = TRUE))
+    return(read_csv(raw, show_col_types = FALSE, trim_ws = TRUE))
   }
   csv <- Sys.getenv("CRED_CSV", "")
   if (nzchar(csv)) {
@@ -108,7 +107,8 @@ safe_data_dir <- function() {
   d
 }
 
-db_path <- Sys.getenv("APP_DB_PATH", file.path(safe_data_dir(), "appdata.sqlite"))
+db_path <- Sys.getenv("APP_DB_PATH") #Sys.getenv("APP_DB_PATH", file.path(safe_data_dir(), "appdata.sqlite"))
+logf("db_path:", db_path)
 db <- pool::dbPool(RSQLite::SQLite(), dbname = db_path)
 
 # FIX: reliability PRAGMAs
