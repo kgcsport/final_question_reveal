@@ -4,7 +4,11 @@
 options(shiny.sanitize.errors = FALSE, shiny.fullstacktrace = TRUE)
 logf <- function(...) { cat(format(Sys.time()), "-", paste(..., collapse=" "), "\n", file=stderr()); flush(stderr()) }
 
-pacman::p_load(shiny, DBI, RSQLite, pool, tidyverse)
+library(shiny)
+library(DBI)
+library(RSQLite)
+library(pool)
+library(tidyverse)
 
 # 1) Pick a persistent, writable dir.
 # On Posit Connect/Cloud, CONNECT_CONTENT_DIR points to per-app persistent storage.
