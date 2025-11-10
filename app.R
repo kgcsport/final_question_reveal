@@ -539,6 +539,37 @@ server <- function(input, output, session) {
     )
   })
 
+  output$admin_student_sliders <- renderUI({
+    req(is_admin())
+    st <- current_state()
+    s  <- current_settings()
+
+    users <- DBI::dbGetQuery(db, "SELECT user_id, display_name FROM users WHERE is_admin=0;")
+
+    tagList(
+      h5("Adjust or pledge for students"),
+      lapply(seq_len(nrow(users)), function(i) {
+        uid <- users$user_id[i]
+        nm  <- users$display_name[i]
+        fluidRow(
+          column(5, strong(nm)),
+          column(5, sliderInput(
+            paste0("admin_slider_", uid),
+            label = NULL,
+            min = 0,
+            max = s$max_per_student,
+            step = s$slider_step,
+            value = 0
+          )),
+          column(2,
+            actionButton(paste0("admin_give_", uid), "Add", class="btn-success btn-sm"),
+            actionButton(paste0("admin_pledge_", uid), "Pledge", class="btn-primary btn-sm")
+          )
+        )
+      })
+    )
+  })
+
   # ---- Submit pledge
   observeEvent(input$submit_pledge, {
     req(authed())
@@ -643,6 +674,7 @@ server <- function(input, output, session) {
       ),
       admin_pledges_upload_ui,
       h5("Pledges this round"),
+      uiOutput("admin_student_sliders"),    # 👈 add here
       tags$hr(),
       textAreaInput("admin_question", "Question (revealed only if cost is met):",
                     value = title_from_html(QUESTIONS[[min(current_state()$unlocked_units + 1L, length(QUESTIONS))]]),
@@ -700,6 +732,43 @@ server <- function(input, output, session) {
       sep = "\n"
     )
   })
+
+  # dynamic observers for each student's sliders
+  observe({
+    req(is_admin())
+    users <- DBI::dbGetQuery(db, "SELECT user_id FROM users WHERE is_admin=0;")
+    st <- current_state()
+
+    lapply(users$user_id, function(uid) {
+
+      # --- Add points (top-up)
+      observeEvent(input[[paste0("admin_give_", uid)]], {
+        val <- as.numeric(input[[paste0("admin_slider_", uid)]])
+        if (!is.na(val) && val > 0) {
+          # Create a “gift” record in charges table (negative amount = refund)
+          DBI::dbExecute(db,
+            "INSERT INTO charges(user_id, round, amount)
+            VALUES(?, 9998, ?)
+            ON CONFLICT(user_id, round) DO UPDATE SET amount = amount + excluded.amount;",
+            params = list(uid, -val)
+          )
+          showNotification(glue("Added {val} points to {uid}."), type="message")
+          bump_admin()
+        }
+      }, ignoreInit = TRUE)
+
+      # --- Pledge for them
+      observeEvent(input[[paste0("admin_pledge_", uid)]], {
+        val <- as.numeric(input[[paste0("admin_slider_", uid)]])
+        if (!is.na(val) && val > 0) {
+          upsert_pledge(uid, st$round, val, name=NULL)
+          showNotification(glue("Pledged {val} points for {uid}."), type="message")
+          bump_admin()
+        }
+      }, ignoreInit = TRUE)
+    })
+  })
+
 
   # ---- Projector view
   output$projector_ui <- renderUI({
