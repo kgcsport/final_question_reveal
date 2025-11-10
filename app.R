@@ -95,6 +95,14 @@ safe_data_dir <- function() {
 }
 
 # --- DB helpers (DRY all DBI:: calls) ---
+
+get_con <- function() {
+  if (inherits(db, "pool") && !pool::poolClosed(db)) return(db)
+  logf("Reopening DB pool...")
+  pool::dbPool(RSQLite::SQLite(), dbname = db_path)
+}
+
+
 # Default to global pool unless a connection/pool is explicitly passed
 db_exec <- function(sql, params = list(), con = NULL) {
   conn <- con %||% get_con()
@@ -274,12 +282,6 @@ user_cumulative_charged <- function(user_id){
     db_query("SELECT COALESCE(SUM(amount),0) AS total FROM charges WHERE user_id=?;", params = list(user_id))$total[1],
     error = function(e) 0
   )
-}
-
-get_con <- function() {
-  if (inherits(db, "pool") && !pool::poolClosed(db)) return(db)
-  logf("Reopening DB pool...")
-  pool::dbPool(RSQLite::SQLite(), dbname = db_path)
 }
 
 charge_round_bank_all <- function(round) {
