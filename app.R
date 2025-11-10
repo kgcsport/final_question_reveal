@@ -96,20 +96,32 @@ safe_data_dir <- function() {
 
 # --- DB helpers (DRY all DBI:: calls) ---
 
-get_con <- function() {
-  if (inherits(db, "pool") && !pool::poolClosed(db)) return(db)
-  logf("Reopening DB pool...")
-  pool::dbPool(RSQLite::SQLite(), dbname = db_path)
-}
-
+get_con <- local({
+  cached <- NULL
+  function() {
+    # reuse cached if alive
+    if (inherits(cached, "pool") && !pool::poolClosed(cached)) return(cached)
+    # reuse global db if alive (don’t overwrite it)
+    if (exists("db", inherits = TRUE) &&
+        inherits(db, "pool") && !pool::poolClosed(db)) {
+      cached <<- db
+      # logf("Reusing global DB pool.")
+      return(cached)
+    }
+    # ONLY here do we create a fresh pool (nothing alive)
+    # logf("Reopening DB pool...")
+    cached <<- pool::dbPool(RSQLite::SQLite(), dbname = db_path)
+    cached
+  }
+})
 
 # Default to global pool unless a connection/pool is explicitly passed
-db_exec <- function(sql, params = list(), con = NULL) {
+db_exec <- function(sql, params = NULL, con = NULL) {
   conn <- con %||% get_con()
   DBI::dbExecute(conn, sql, params = params)
 }
 
-db_query <- function(sql, params = list(), con = NULL) {
+db_query <- function(sql, params = NULL, con = NULL) {
   conn <- con %||% get_con()
   DBI::dbGetQuery(conn, sql, params = params)
 }
@@ -127,6 +139,7 @@ q_user_round <- function(uid, r) db_query("SELECT COALESCE(pledge,0) AS p
                                            FROM pledges WHERE user_id=? AND round=?;",
                                            list(uid, as.integer(r)))
 
+logf("Setting up database connection...")
 db_path <- file.path(safe_data_dir(), "appdata.sqlite")
 db <- pool::dbPool(RSQLite::SQLite(), dbname = db_path)
 
@@ -140,7 +153,9 @@ try({
 # Close pool on session end & process exit
 reg.finalizer(environment(), function(e) try(pool::poolClose(db), silent = TRUE), onexit = TRUE)
 
+logf("Initializing database...")
 init_db <- function() {
+  logf("Creating users table...")
   db_exec("
     CREATE TABLE IF NOT EXISTS users (
       user_id TEXT PRIMARY KEY,
@@ -187,7 +202,7 @@ init_db <- function() {
       charged_at TEXT DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (user_id, round)
     );")
-
+  
   # Seed settings/state if missing
   nset <- db_query("SELECT COUNT(*) n FROM settings WHERE id=1;")$n[1]
   if (is.na(nset) || nset == 0) {
@@ -212,6 +227,7 @@ init_db <- function() {
   })
 }
 init_db()
+logf("Database initialized.")
 
 # Convenience getters/setters with SAFE defaults
 blank_settings <- function() tibble(
@@ -353,6 +369,7 @@ ui <- fluidPage(
 # -------------------------
 # Server
 # -------------------------
+logf("Starting server...")
 server <- function(input, output, session) {
 
   rv <- reactiveValues(
@@ -393,7 +410,7 @@ server <- function(input, output, session) {
 
   # ---- reactivePoll heartbeats (HARDENED)
   settings_poll <- reactivePoll(
-    1200, session,
+    2000, session,
     checkFunc = function() {
       out <- try(db_query("SELECT updated_at FROM game_state WHERE id=1;"), silent = TRUE)
       if (inherits(out, "try-error") || !is.data.frame(out) || nrow(out) == 0) {
@@ -769,7 +786,7 @@ server <- function(input, output, session) {
     showNotification(glue::glue("Pledged {amt} points for {uid}."), type="message")
 
     # heartbeat so everyone refreshes
-    db_exec("UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
+    touch_heartbeat()
     bump_admin(); rv$my_submission_pulse <- rv$my_submission_pulse + 1L
   }, ignoreInit = TRUE)
 
@@ -829,8 +846,10 @@ server <- function(input, output, session) {
     rt <- round_totals(st$round)
     effective_total <- rt$pledged + st$carryover
     carryforward <- max(0, effective_total - s$cost)
+    units_now <- as.integer(floor(effective_total / s$cost))
+    new_carry <- effective_total - units_now * s$cost
     list(pledged=rt$pledged, carryover=st$carryover,
-        effective_total=effective_total, carryforward=carryforward, cost=s$cost)
+        effective_total=effective_total, carryforward=carryforward, cost=s$cost, units_now=units_now, new_carry=new_carry)
   }
 
   output$wtp_total <- DT::renderDT({
