@@ -690,7 +690,7 @@ server <- function(input, output, session) {
             actionButton("admin_do_add",    "Add points", class = "btn-success")
           )
         )
-      )
+      ),
       tags$hr(),
       textAreaInput("admin_question", "Question (revealed only if cost is met):",
                     value = title_from_html(QUESTIONS[[min(current_state()$unlocked_units + 1L, length(QUESTIONS))]]),
