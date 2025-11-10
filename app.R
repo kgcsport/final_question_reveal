@@ -969,14 +969,20 @@ server <- function(input, output, session) {
     })
 
     # Recompute unlocked & carryover from uploaded pledges
-    s <- get_settings()
-    totals <- DBI::dbGetQuery(db, "SELECT COALESCE(SUM(pledge),0) AS sum_pledge FROM pledges;")$sum_pledge[1]
+    st <- get_state()
+    s  <- get_settings()
+    pledge_total <- DBI::dbGetQuery(db, "SELECT COALESCE(SUM(pledge),0) AS sum_pledge FROM pledges;")$sum_pledge[1]
+    totals <- pledge_total + st$carryover
     unlocked_units <- as.integer(floor(totals / s$cost))
     carryover <- totals - unlocked_units * s$cost
     set_state(unlocked_units = unlocked_units, carryover = carryover)
 
+    # Touch heartbeat AFTER transaction so reactivePoll sees it
+    DBI::dbExecute(db, "UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id = 1;")
+
     showNotification("Prior pledges uploaded and set.", type = "message")
     bump_admin()
+    bump_round()
   })
 
   observeEvent(input$end_game, ignoreInit = TRUE, {
