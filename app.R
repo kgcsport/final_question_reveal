@@ -24,19 +24,6 @@ logf("CRED_B64 nchar:", nchar(Sys.getenv("CRED_B64", "")))
 logf("CRED_CSV nchar:", nchar(Sys.getenv("CRED_CSV", "")))
 logf("CRED_PATH:", Sys.getenv("CRED_PATH", ""))
 
-# -------------------------
-# Credentials (unchanged-ish, but with better errors)
-# -------------------------
-# cred_b64 <- Sys.getenv("CRED_B64", "")
-# if (!nzchar(cred_b64)) {
-#   stop("CRED_B64 env var is empty. Set base64-encoded CSV with columns: name,user,is_admin,pw_hash")
-# }
-# cred_txt <- rawToChar(base64enc::base64decode(cred_b64))
-# CRED <- readr::read_csv(readr::I(cred_txt), show_col_types = FALSE)
-
-library(readr)
-library(base64enc)
-
 get_credentials <- function() {
   b64 <- Sys.getenv("CRED_B64", "")
   if (nzchar(b64)) {
@@ -107,27 +94,52 @@ safe_data_dir <- function() {
   d
 }
 
+# --- DB helpers (DRY all DBI:: calls) ---
+# Default to global pool unless a connection/pool is explicitly passed
+db_exec <- function(sql, params = list(), con = NULL) {
+  conn <- con %||% get_con()
+  DBI::dbExecute(conn, sql, params = params)
+}
+
+db_query <- function(sql, params = list(), con = NULL) {
+  conn <- con %||% get_con()
+  DBI::dbGetQuery(conn, sql, params = params)
+}
+
+touch_heartbeat <- function() db_exec("UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
+is_open         <- function(x) isTRUE(as.logical(x))
+
+# Common selects
+q_settings   <- function() db_query("SELECT * FROM settings WHERE id=1;")
+q_state      <- function() db_query("SELECT * FROM game_state WHERE id=1;")
+q_round_tot  <- function(r) db_query("SELECT COALESCE(SUM(pledge),0) AS pledged,
+                                      COUNT(DISTINCT user_id) AS n_users
+                                      FROM pledges WHERE round=?;", list(as.integer(r)))
+q_user_round <- function(uid, r) db_query("SELECT COALESCE(pledge,0) AS p
+                                           FROM pledges WHERE user_id=? AND round=?;",
+                                           list(uid, as.integer(r)))
+
 db_path <- file.path(safe_data_dir(), "appdata.sqlite")
 db <- pool::dbPool(RSQLite::SQLite(), dbname = db_path)
 
 # FIX: reliability PRAGMAs
 try({
-  DBI::dbExecute(db, "PRAGMA journal_mode=WAL;")
-  DBI::dbExecute(db, "PRAGMA synchronous=NORMAL;")
-  DBI::dbExecute(db, "PRAGMA busy_timeout=5000;")
+  db_exec("PRAGMA journal_mode=WAL;")
+  db_exec("PRAGMA synchronous=NORMAL;")
+  db_exec("PRAGMA busy_timeout=5000;")
 }, silent = TRUE)
 
 # Close pool on session end & process exit
 reg.finalizer(environment(), function(e) try(pool::poolClose(db), silent = TRUE), onexit = TRUE)
 
 init_db <- function() {
-  DBI::dbExecute(db, "
+  db_exec("
     CREATE TABLE IF NOT EXISTS users (
       user_id TEXT PRIMARY KEY,
       display_name TEXT,
       is_admin INTEGER DEFAULT 0
     );")
-  DBI::dbExecute(db, "
+  db_exec("
     CREATE TABLE IF NOT EXISTS settings (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       cost REAL,
@@ -137,7 +149,7 @@ init_db <- function() {
       round_timeout_sec REAL,
       shortfall_policy TEXT
     );")
-  DBI::dbExecute(db, "
+  db_exec("
     CREATE TABLE IF NOT EXISTS game_state (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       round INTEGER,
@@ -149,7 +161,7 @@ init_db <- function() {
       started_at TEXT,
       updated_at TEXT DEFAULT (CURRENT_TIMESTAMP)
     );")
-  DBI::dbExecute(db, "
+  db_exec("
     CREATE TABLE IF NOT EXISTS pledges (
       user_id TEXT,
       round INTEGER,
@@ -158,8 +170,8 @@ init_db <- function() {
       when_ts TEXT DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (user_id, round)
     );")
-  DBI::dbExecute(db, "CREATE INDEX IF NOT EXISTS ix_pledges_round ON pledges(round);")
-  DBI::dbExecute(db, "
+  db_exec("CREATE INDEX IF NOT EXISTS ix_pledges_round ON pledges(round);")
+  db_exec("
     CREATE TABLE IF NOT EXISTS charges (
       user_id TEXT,
       round INTEGER,
@@ -169,22 +181,22 @@ init_db <- function() {
     );")
 
   # Seed settings/state if missing
-  nset <- DBI::dbGetQuery(db, "SELECT COUNT(*) n FROM settings WHERE id=1;")$n[1]
+  nset <- db_query("SELECT COUNT(*) n FROM settings WHERE id=1;")$n[1]
   if (is.na(nset) || nset == 0) {
-    DBI::dbExecute(db, "
+    db_exec("
       INSERT INTO settings(id, cost, max_per_student, slider_step, max_for_admin, round_timeout_sec, shortfall_policy)
       VALUES(1, 24, 7.5, 0.5, 100, NULL, 'bank_all');")
   }
-  ngs <- DBI::dbGetQuery(db, "SELECT COUNT(*) n FROM game_state WHERE id=1;")$n[1]
+  ngs <- db_query("SELECT COUNT(*) n FROM game_state WHERE id=1;")$n[1]
   if (is.na(ngs) || ngs == 0) {
-    DBI::dbExecute(db, glue("
+    db_exec(glue("
       INSERT INTO game_state(id, round, round_open, carryover, unlocked_units, scale_factor, question_text, started_at)
       VALUES(1, 1, 0, 0, 0, NULL, {DBI::dbQuoteString(db, as.character(QUESTIONS[[1]]))}, NULL);"))
   }
 
   # Upsert users from CRED
   purrr::walk(seq_len(nrow(CRED)), function(i){
-    DBI::dbExecute(db, "
+    db_exec("
       INSERT INTO users(user_id, display_name, is_admin)
       VALUES(?, ?, ?)
       ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, is_admin=excluded.is_admin;",
@@ -195,92 +207,53 @@ init_db()
 
 # Convenience getters/setters with SAFE defaults
 blank_settings <- function() tibble(
-  id = 1, cost = 24, max_per_student = 7.5, slider_step = 0.5,
-  max_for_admin = 100, round_timeout_sec = NA_real_, shortfall_policy = "bank_all"
+  id=1, cost=24, max_per_student=7.5, slider_step=0.5,
+  max_for_student=100, round_timeout_sec=NA_real_, shortfall_policy="bank_all"
 )
+
 blank_state <- function() tibble(
-  id = 1, round = 1, round_open = 0, carryover = 0, unlocked_units = 0,
-  scale_factor = NA_real_, question_text = as.character(QUESTIONS[[1]]),
-  started_at = NA_character_, updated_at = as.character(Sys.time())
+  id=1, round=1, round_open=0, carryover=0, unlocked_units=0,
+  scale_factor=NA_real_, question_text=as.character(QUESTIONS[[1]]),
+  started_at=NA_character_, updated_at=as.character(Sys.time())
 )
 
-get_settings <- function(){
-  out <- try(DBI::dbGetQuery(db, "SELECT * FROM settings WHERE id=1;"), silent = TRUE)
-  if (inherits(out, "try-error") || !is.data.frame(out) || nrow(out) == 0) blank_settings() else out
-}
+get_settings <- function() { out <- q_settings(); if (nrow(out)) out else blank_settings() }
+get_state    <- function() { out <- q_state();    if (nrow(out)) out else blank_state() }
 
-set_settings <- function(cost = NULL,
-                         max_per_student = NULL,
-                         slider_step = NULL,
-                         max_for_admin = NULL,
-                         round_timeout_sec = NULL,   # NULL = leave as-is; NA = set to SQL NULL
-                         shortfall_policy = NULL) {
+set_settings <- function(...) {
+  dots <- list(...)
+  if (!length(dots)) return(invisible(TRUE))
 
-  args <- list(
-    cost = cost,
-    max_per_student = max_per_student,
-    slider_step = slider_step,
-    max_for_admin = max_for_admin,
-    round_timeout_sec = round_timeout_sec,
-    shortfall_policy = shortfall_policy
-  )
-
-  # Keep only fields the caller actually supplied (not NULL)
-  to_update <- Filter(function(x) !is.null(x), args)
-  if (!length(to_update)) return(invisible(TRUE))
-
-  # Build the UPDATE statement: NA --> "col = NULL", otherwise "col = ?"
-  set_clauses <- character()
-  params <- list()
-
-  for (nm in names(to_update)) {
-    val <- to_update[[nm]]
-
-    # Enforce scalar inputs (fail fast, clear error)
+  clauses <- c(); params <- list()
+  for (nm in names(dots)) {
+    val <- dots[[nm]]
     if (length(val) != 1) stop(sprintf("`%s` must be length 1", nm))
-
     if (is.na(val)) {
-      # Explicitly clear this field to SQL NULL
-      set_clauses <- c(set_clauses, sprintf("%s = NULL", nm))
+      clauses <- c(clauses, sprintf("%s = NULL", nm))
     } else {
-      set_clauses <- c(set_clauses, sprintf("%s = ?", nm))
-      params <- c(params, list(val))
+      clauses <- c(clauses, sprintf("%s = ?", nm)); params <- c(params, list(val))
     }
   }
-
-  sql <- paste0("UPDATE settings SET ", paste(set_clauses, collapse = ", "), " WHERE id = 1;")
-  DBI::dbExecute(db, sql, params = params)
-
-  # bump the poll heartbeat
-  DBI::dbExecute(db, "UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id = 1;")
+  db_exec(paste0("UPDATE settings SET ", paste(clauses, collapse=", "), " WHERE id=1;"), params)
+  touch_heartbeat()
   invisible(TRUE)
 }
 
-get_state <- function(){
-  out <- try(DBI::dbGetQuery(db, "SELECT * FROM game_state WHERE id=1;"), silent = TRUE)
-  if (inherits(out, "try-error") || !is.data.frame(out) || nrow(out) == 0) blank_state() else out
-}
 set_state <- function(...) {
   dots <- list(...)
-  if (length(dots) == 0) {
-    DBI::dbExecute(db, "UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
-    return(invisible(TRUE))
-  }
+  if (!length(dots)) return(invisible(touch_heartbeat()))
   nm <- names(dots)
-  set_clause <- paste0(nm, " = ?", collapse = ", ")
-  DBI::dbExecute(
-    db,
-    paste0("UPDATE game_state SET ", set_clause, ", updated_at = CURRENT_TIMESTAMP WHERE id=1;"),
-    params = unname(dots)
-  )
+  sql <- paste0("UPDATE game_state SET ", paste0(nm, " = ?", collapse=", "),
+                ", updated_at = CURRENT_TIMESTAMP WHERE id=1;")
+  db_exec(sql, unname(dots))
   invisible(TRUE)
 }
 
 upsert_pledge <- function(user_id, round, pledge, name=NULL){
   if (!is.null(name)) {
-    DBI::dbExecute(db, "UPDATE users SET display_name=? WHERE user_id=?;", params = list(name, user_id))
+    db_exec("UPDATE users SET display_name=? WHERE user_id=?;", params = list(name, user_id))
   }
-  DBI::dbExecute(db, "
+  db_exec("
     INSERT INTO pledges(user_id, round, pledge)
     VALUES(?, ?, ?)
     ON CONFLICT(user_id, round) DO UPDATE SET pledge=excluded.pledge, when_ts=CURRENT_TIMESTAMP;",
@@ -290,7 +263,7 @@ upsert_pledge <- function(user_id, round, pledge, name=NULL){
 
 round_totals <- function(round){
   tryCatch(
-    DBI::dbGetQuery(db, "SELECT COALESCE(SUM(pledge),0) AS pledged, COUNT(DISTINCT user_id) AS n_users
+    db_query("SELECT COALESCE(SUM(pledge),0) AS pledged, COUNT(DISTINCT user_id) AS n_users
                          FROM pledges WHERE round = ?;", params = list(as.integer(round))),
     error = function(e) tibble(pledged = 0, n_users = 0)
   )
@@ -298,18 +271,9 @@ round_totals <- function(round){
 
 user_cumulative_charged <- function(user_id){
   tryCatch(
-    DBI::dbGetQuery(db, "SELECT COALESCE(SUM(amount),0) AS total FROM charges WHERE user_id=?;", params = list(user_id))$total[1],
+    db_query("SELECT COALESCE(SUM(amount),0) AS total FROM charges WHERE user_id=?;", params = list(user_id))$total[1],
     error = function(e) 0
   )
-}
-
-charge_round_bank_all <- function(round, spend_units, cost){
-  pool::poolWithTransaction(db, function(con){
-    DBI::dbExecute(con, "DELETE FROM charges WHERE round = ?;", params = list(round))
-    DBI::dbExecute(con, "
-      INSERT INTO charges(user_id, round, amount)
-      SELECT user_id, round, pledge FROM pledges WHERE round = ?;", params = list(round))
-  })
 }
 
 get_con <- function() {
@@ -318,22 +282,39 @@ get_con <- function() {
   pool::dbPool(RSQLite::SQLite(), dbname = db_path)
 }
 
+charge_round_bank_all <- function(round) {
+  pool::poolWithTransaction(get_con(), function(con){
+    db_exec("DELETE FROM charges WHERE round = ?;", params = list(round), con=con)
+    db_exec("INSERT INTO charges(user_id, round, amount)
+       SELECT user_id, round, pledge FROM pledges WHERE round = ?;", params = list(round), con=con)
+  })
+}
+
 refund_carryover_proportionally <- function(carry){
   if (carry <= 0) return(invisible(FALSE))
-  tc <- DBI::dbGetQuery(db, "SELECT user_id, COALESCE(SUM(amount),0) AS charged FROM charges GROUP BY user_id;")
+  tc <- db_query("SELECT user_id, COALESCE(SUM(amount),0) AS charged FROM charges GROUP BY user_id;")
   tot <- sum(tc$charged)
   if (tot <= 0) return(invisible(FALSE))
   tc$refund <- carry * (tc$charged / tot)
   now <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-  pool::poolWithTransaction(db, function(con){
+  pool::poolWithTransaction(get_con(), function(con){
     purrr::pwalk(tc[, c("user_id","refund")], function(user_id, refund){
-      DBI::dbExecute(con, "INSERT INTO charges(user_id, round, amount, charged_at) VALUES(?, 9999, ?, ?);",
-                    params = list(user_id, -as.numeric(refund), now))
+      db_exec("INSERT INTO charges(user_id, round, amount, charged_at) VALUES(?, 9999, ?, ?);", params = list(user_id, -as.numeric(refund), now), con=con)
     })
     # set_state() writes outside the transaction; update via 'con' here:
-    DBI::dbExecute(con, "UPDATE game_state SET carryover=0, round_open=0, updated_at=CURRENT_TIMESTAMP WHERE id=1;")
+    db_exec("UPDATE game_state SET carryover=0, round_open=0, updated_at=CURRENT_TIMESTAMP WHERE id=1;", con=con)
   })
   TRUE
+}
+
+render_unlocked_questions <- function(units) {
+  idx <- seq_len(min(units, length(QUESTIONS)))
+  tagList(
+    h5(if (units == 1) "Unlocked Question" else sprintf("Unlocked Questions (%d)", units)),
+    lapply(rev(idx), function(i) {
+      wellPanel(div(style="font-size:1.15em; line-height:1.5;", HTML(as.character(QUESTIONS[[i]]))))
+    })
+  )
 }
 
 # -------------------------
@@ -412,7 +393,7 @@ server <- function(input, output, session) {
   settings_poll <- reactivePoll(
     1200, session,
     checkFunc = function() {
-      out <- try(DBI::dbGetQuery(db, "SELECT updated_at FROM game_state WHERE id=1;"), silent = TRUE)
+      out <- try(db_query("SELECT updated_at FROM game_state WHERE id=1;"), silent = TRUE)
       if (inherits(out, "try-error") || !is.data.frame(out) || nrow(out) == 0) {
         as.character(Sys.time())  # force a tick; we'll serve defaults below
       } else {
@@ -430,29 +411,14 @@ server <- function(input, output, session) {
   current_state    <- reactive(settings_poll()$state)
 
   # ---- Helpers
-  remaining_cap <- reactive({
-    req(authed())
-    s <- current_settings()
-    spent <- user_cumulative_charged(user_id())
-    pmax(0, s$max_per_student - spent)
-  })
-
-  # remaining cap for an arbitrary user (subtracts spent + current round pledge)
   remaining_cap_for <- function(uid) {
     s  <- get_settings()
     st <- get_state()
-    spent <- user_cumulative_charged(uid)
-
-    curp <- tryCatch(
-      DBI::dbGetQuery(db,
-        "SELECT COALESCE(pledge,0) AS p FROM pledges WHERE user_id=? AND round=?;",
-        params = list(uid, st$round)
-      )$p[1],
-      error = function(e) 0
-    )
-    curp <- ifelse(is.na(curp), 0, curp)
-    cap <- s$max_per_student - spent - curp
-    pmax(0, as.numeric(cap))
+    spent <- tryCatch(db_query("SELECT COALESCE(SUM(amount),0) AS total FROM charges WHERE user_id=?;",
+                              list(uid))$total[1], error=function(e) 0)
+    curp  <- tryCatch(q_user_round(uid, st$round)$p[1], error=function(e) 0)
+    curp  <- ifelse(is.na(curp), 0, curp)
+    pmax(0, as.numeric(s$max_per_student - spent - curp))
   }
 
   # snap to slider step (and coerce nonnegative)
@@ -461,8 +427,6 @@ server <- function(input, output, session) {
     if (!is.finite(x) || x < 0) return(0)
     round(x / step) * step
   }
-
-  is_open <- function(x) isTRUE(as.logical(x))
 
   output$whoami <- renderUI({
     req(authed())
@@ -522,14 +486,7 @@ server <- function(input, output, session) {
                   p("Once the class total meets the cost, the question will appear here."))
       )
     } else if (st$unlocked_units > 0) {
-      reveal_idx <- seq_len(min(st$unlocked_units, length(QUESTIONS)))
-      tagList(
-        p("Pledging is CLOSED."),
-        h5("Unlocked Questions"),
-        lapply(rev(reveal_idx), function(i){
-          wellPanel(div(style="font-size:1.15em; line-height:1.5;", HTML(as.character(QUESTIONS[[i]]))))
-        })
-      )
+      render_unlocked_questions(st$unlocked_units)
     } else {
       p("Pledging is CLOSED. Waiting for instructor to open the next round.")
     }
@@ -547,7 +504,7 @@ server <- function(input, output, session) {
   # ---- Pledge UI
   output$pledge_ui <- renderUI({
     st <- current_state(); s <- current_settings()
-    cap <- if (is_admin()) s$max_for_admin else remaining_cap()
+    cap <- if (is_admin()) s$max_for_admin else remaining_cap_for(user_id())
     cur <- isolate(if (is.null(input$pledge)) 0 else as.numeric(input$pledge))
     val <- min(cur, cap)
     tagList(
@@ -585,7 +542,7 @@ server <- function(input, output, session) {
   output$my_submissions <- renderDT({
     req(authed())
     df <- tryCatch(
-      DBI::dbGetQuery(db, "SELECT round, ? AS name, pledge, charged, when_ts AS 'when' FROM pledges WHERE user_id=? ORDER BY round DESC;",
+      db_query("SELECT round, ? AS name, pledge, charged, when_ts AS 'when' FROM pledges WHERE user_id=? ORDER BY round DESC;",
                       params = list(dispname(), user_id())),
       error = function(e) tibble(round=integer(), name=character(), pledge=numeric(), charged=double(), when=character())
     )
@@ -598,8 +555,7 @@ server <- function(input, output, session) {
       return(DT::datatable(data.frame(), options = list(dom = 't'), rownames = FALSE))
     }
     df <- tryCatch(
-      DBI::dbGetQuery(
-        db,
+      db_query(
         "SELECT round AS Round, pledge AS Pledge, charged AS Charged, when_ts AS Submitted
          FROM pledges WHERE user_id=? ORDER BY round ASC;",
         params = list(user_id())
@@ -674,7 +630,7 @@ server <- function(input, output, session) {
           column(4,
             selectInput("admin_target_user", "Student",
               choices = {
-                us <- DBI::dbGetQuery(db, "SELECT user_id, display_name FROM users WHERE is_admin=0 ORDER BY display_name;")
+                us <- db_query("SELECT user_id, display_name FROM users WHERE is_admin=0 ORDER BY display_name;")
                 setNames(us$user_id, us$display_name)
               }
             ),
@@ -759,7 +715,7 @@ server <- function(input, output, session) {
     cap <- remaining_cap_for(uid)
 
     curp <- tryCatch(
-      DBI::dbGetQuery(db,
+      db_query(
         "SELECT COALESCE(pledge,0) AS p FROM pledges WHERE user_id=? AND round=?;",
         params = list(uid, st$round))$p[1],
       error = function(e) 0
@@ -811,7 +767,7 @@ server <- function(input, output, session) {
     showNotification(glue::glue("Pledged {amt} points for {uid}."), type="message")
 
     # heartbeat so everyone refreshes
-    DBI::dbExecute(db, "UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
+    db_exec("UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
     bump_admin(); rv$my_submission_pulse <- rv$my_submission_pulse + 1L
   }, ignoreInit = TRUE)
 
@@ -825,7 +781,7 @@ server <- function(input, output, session) {
       showNotification("Amount must be > 0.", type="warning"); return()
     }
     # Negative 'charge' adds back capacity (round 9998 reserved for admin gifts)
-    DBI::dbExecute(db,
+    db_exec(
       "INSERT INTO charges(user_id, round, amount)
       VALUES(?, 9998, ?)
       ON CONFLICT(user_id, round) DO UPDATE SET amount = amount + excluded.amount;",
@@ -833,7 +789,7 @@ server <- function(input, output, session) {
     )
     showNotification(glue::glue("Added {amt} points to {uid}."), type="message")
 
-    DBI::dbExecute(db, "UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
+    db_exec("UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
     bump_admin(); bump_round()
   }, ignoreInit = TRUE)
 
@@ -867,13 +823,13 @@ server <- function(input, output, session) {
     )
   })
 
-  wtp_summary <- reactive({
-    st <- current_state(); s <- current_settings()
+  wtp_summary <- function(st = get_state(), s = get_settings()) {
     rt <- round_totals(st$round)
     effective_total <- rt$pledged + st$carryover
     carryforward <- max(0, effective_total - s$cost)
-    list(pledged=rt$pledged, carryover=st$carryover, effective_total=effective_total, carryforward=carryforward, cost=s$cost)
-  })
+    list(pledged=rt$pledged, carryover=st$carryover,
+        effective_total=effective_total, carryforward=carryforward, cost=s$cost)
+  }
 
   output$wtp_total <- DT::renderDT({
     s <- wtp_summary()
@@ -887,7 +843,7 @@ server <- function(input, output, session) {
 
   round_df <- reactive({
     st <- current_state()
-    tryCatch(DBI::dbGetQuery(db, "SELECT pledge FROM pledges WHERE round = ?;", params = list(st$round)),
+    tryCatch(db_query("SELECT pledge FROM pledges WHERE round = ?;", params = list(st$round)),
              error = function(e) tibble(pledge = numeric()))
   })
 
@@ -901,7 +857,7 @@ server <- function(input, output, session) {
   output$wtp_hist <- renderPlot({
     # df <- round_df() 
     st <- current_state()
-    df <- DBI::dbGetQuery(db, "SELECT pledge, round FROM pledges WHERE round <= ?;", params = list(st$round))
+    df <- db_query("SELECT pledge, round FROM pledges WHERE round <= ?;", params = list(st$round))
     s <- current_settings()
     
     ggplot2::ggplot(df, ggplot2::aes(x = pledge,fill=as.factor(round))) +
@@ -916,17 +872,9 @@ server <- function(input, output, session) {
 
   output$projector_question <- renderUI({
     st <- current_state(); k <- length(QUESTIONS)
-    if (st$unlocked_units > 0) {
-      reveal_idx <- seq_len(min(st$unlocked_units, length(QUESTIONS)))
-      tagList(
-        h3(sprintf("Unlocked Questions (%g)", st$unlocked_units)),
-        lapply(rev(reveal_idx), function(i){
-          wellPanel(div(style="font-size:1.15em; line-height:1.5;", HTML(as.character(QUESTIONS[[i]]))))
-        })
-      )
-    }
+    if (st$unlocked_units > 0) return(render_unlocked_questions(st$unlocked_units))
     else {
-          s <- current_settings()
+      s <- current_settings()
       wellPanel(
         h4("Question(s) locked"),
         p(sprintf("Carryover from last round: %g; COST per question: %g.", st$carryover, s$cost)),
@@ -946,7 +894,7 @@ server <- function(input, output, session) {
   output$dl_pledges_csv <- downloadHandler(
     filename = function() "pledges.csv",
     content = function(file) {
-      df <- DBI::dbGetQuery(db, "SELECT * FROM pledges ORDER BY round, user_id;")
+      df <- db_query("SELECT * FROM pledges ORDER BY round, user_id;")
       readr::write_csv(df, file)
     }
   )
@@ -967,47 +915,45 @@ server <- function(input, output, session) {
     req(is_admin())
     st <- current_state()
     set_state(round_open = 1, scale_factor = NA, started_at = as.character(Sys.time()))
-    DBI::dbExecute(db, "DELETE FROM pledges WHERE round = ?;", params = list(st$round))
+    db_exec("DELETE FROM pledges WHERE round = ?;", params = list(st$round))
     showNotification(glue("Pledging is OPEN for round {st$round}. Carryover available: {st$carryover}."), type="message")
     bump_admin()
   })
 
   observeEvent(input$close_round, ignoreInit = TRUE, {
     req(is_admin())
-    st <- current_state(); s <- current_settings()
+    st <- get_state(); s <- get_settings()
     if (!is_open(st$round_open)) return(NULL)
 
-    rt <- round_totals(st$round)
-    total_available <- st$carryover + rt$pledged
-    units_now <- as.integer(floor(total_available / s$cost))
-    spend_now <- units_now * s$cost
+    ws <- wtp_summary()
 
     if (identical(s$shortfall_policy, "bank_all")) {
-      charge_round_bank_all(st$round, units_now, s$cost)
+      charge_round_bank_all(st$round, ws$units_now, s$cost)
       set_state(scale_factor = 1)
     } else {
-      if (units_now > 0) {
-        charge_round_bank_all(st$round, units_now, s$cost)
+      if (ws$units_now > 0) {
+        charge_round_bank_all(st$round, ws$units_now, s$cost)
         set_state(scale_factor = 1)
       } else {
-        DBI::dbExecute(db, "DELETE FROM charges WHERE round = ?;", params = list(st$round))
+        db_exec("DELETE FROM charges WHERE round = ?;", list(st$round))
         set_state(scale_factor = NA)
       }
     }
 
-    new_carry <- total_available - spend_now
-    set_state(round_open = 0, carryover = new_carry, unlocked_units = st$unlocked_units + units_now)
+    set_state(round_open = 0,
+              carryover  = ws$new_carry,
+              unlocked_units = st$unlocked_units + ws$units_now)
 
-    if (units_now > 0) {
-      showNotification(glue("Purchased {units_now} question(s). New carryover: {round(new_carry, 2)}."), type="message")
-    } else {
-      if (identical(s$shortfall_policy, "bank_all")) {
-        showNotification(glue("Not funded — pledges banked. New carryover: {round(new_carry, 2)}. At game over, carryover will be refunded proportionally."), type="warning")
-      } else {
-        showNotification("Not funded — no one charged; no carryover added.", type="warning")
-      }
-    }
-    bump_admin()
+    showNotification(
+      if (ws$units_now > 0)
+        glue::glue("Purchased {ws$units_now} question(s). New carryover: {round(ws$new_carry, 2)}.")
+      else if (identical(s$shortfall_policy, "bank_all"))
+        glue::glue("Not funded — pledges banked. New carryover: {round(ws$new_carry, 2)}. At game over, carryover will be refunded proportionally.")
+      else
+        "Not funded — no one charged; no carryover added.",
+      type = if (ws$units_now > 0) "message" else "warning"
+    )
+    touch_heartbeat(); bump_admin()
   })
 
   observeEvent(input$next_round, ignoreInit = TRUE, {
@@ -1022,8 +968,8 @@ server <- function(input, output, session) {
 
   observeEvent(input$reset_all, ignoreInit = TRUE, {
     req(is_admin())
-    DBI::dbExecute(db, "DELETE FROM pledges;")
-    DBI::dbExecute(db, "DELETE FROM charges;")
+    db_exec("DELETE FROM pledges;")
+    db_exec("DELETE FROM charges;")
     set_state(unlocked_units = 0L, carryover = 0, round = 1, round_open = 0, scale_factor = NA,
               started_at = NA, question_text = as.character(QUESTIONS[[1]]))
     updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[1]]))
@@ -1061,66 +1007,41 @@ server <- function(input, output, session) {
         charged = suppressWarnings(as.numeric(charged))
       )
 
-    pool::poolWithTransaction(db, function(con){
+    pool::poolWithTransaction(get_con(), function(con){
 
-      # 1) Upsert users (names must match the data frame column names)
+      # 1) Upsert users
       purrr::pwalk(pledges_df[, c("user_id","name")], function(user_id, name){
-        DBI::dbExecute(
-          con,
-          "INSERT INTO users(user_id, display_name) VALUES(?,?)
-          ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name;",
-          params = list(user_id, name)
-        )
+        db_exec("INSERT INTO users(user_id, display_name) VALUES(?,?)
+          ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name;", params = list(user_id, name), con=con)
       })
 
-      # 2) Upsert pledges (this is what was missing)
+      # 2) Upsert pledges
       purrr::pwalk(pledges_df[, c("user_id","round","pledge")], function(user_id, round, pledge){
         if (!is.na(round) && !is.na(pledge)) {
-          DBI::dbExecute(
-            con,
-            "INSERT INTO pledges(user_id, round, pledge, when_ts)
-            VALUES(?,?,?,CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id, round)
-            DO UPDATE SET pledge=excluded.pledge, when_ts=CURRENT_TIMESTAMP;",
-            params = list(user_id, round, pledge)
-          )
+          db_exec("INSERT INTO pledges(user_id, round, pledge, when_ts) VALUES(?,?,?,CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, round) DO UPDATE SET pledge=excluded.pledge, when_ts=CURRENT_TIMESTAMP;", params = list(user_id, round, pledge), con=con)
         }
       })
 
-      # 3) Optional charges (only if provided and nonzero)
+      # 3) Optional charges
       if (!all(is.na(pledges_df$charged))) {
         purrr::pwalk(pledges_df[, c("user_id","round","charged")], function(user_id, round, charged){
           if (!is.na(charged) && charged != 0 && !is.na(round)) {
-            DBI::dbExecute(
-              con,
-              "INSERT INTO charges(user_id, round, amount)
-              VALUES(?,?,?)
-              ON CONFLICT(user_id, round) DO UPDATE SET amount=excluded.amount;",
-              params = list(user_id, round, charged)
-            )
+            db_exec("INSERT INTO charges(user_id, round, amount) VALUES(?,?,?)
+              ON CONFLICT(user_id, round) DO UPDATE SET amount=excluded.amount;", params = list(user_id, round, charged), con=con)
           }
         })
       }
-
-      # Touch game_state.updated_at so reactivePoll wakes up
-      DBI::dbExecute(con, "UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id = 1;")
     })
+    # AFTER the transaction, bump heartbeat so reactivePoll wakes up:
+    touch_heartbeat()
 
-    # Recompute unlocked & carryover from uploaded pledges
-    st <- get_state()
-    s  <- get_settings()
-    pledge_total <- DBI::dbGetQuery(db, "SELECT COALESCE(SUM(pledge),0) AS sum_pledge FROM pledges;")$sum_pledge[1]
-    totals <- pledge_total + st$carryover
-    unlocked_units <- as.integer(floor(totals / s$cost))
-    carryover <- totals - unlocked_units * s$cost
-    set_state(unlocked_units = unlocked_units, carryover = carryover)
-
-    # Touch heartbeat AFTER transaction so reactivePoll sees it
-    DBI::dbExecute(db, "UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id = 1;")
-
-    showNotification("Prior pledges uploaded and set.", type = "message")
-    bump_admin()
-    bump_round()
+    ws <- wtp_summary()
+    set_state(unlocked_units = as.integer(floor(ws$effective_total / ws$cost)),
+              carryover      = ws$effective_total - as.integer(floor(ws$effective_total / ws$cost)) * ws$cost)
+    touch_heartbeat()
+    showNotification("Prior pledges uploaded and set.", type="message")
+    bump_admin(); bump_round()
   })
 
   observeEvent(input$end_game, ignoreInit = TRUE, {
