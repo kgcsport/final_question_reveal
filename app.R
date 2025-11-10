@@ -437,6 +437,31 @@ server <- function(input, output, session) {
     pmax(0, s$max_per_student - spent)
   })
 
+  # remaining cap for an arbitrary user (subtracts spent + current round pledge)
+  remaining_cap_for <- function(uid) {
+    s  <- get_settings()
+    st <- get_state()
+    spent <- user_cumulative_charged(uid)
+
+    curp <- tryCatch(
+      DBI::dbGetQuery(db,
+        "SELECT COALESCE(pledge,0) AS p FROM pledges WHERE user_id=? AND round=?;",
+        params = list(uid, st$round)
+      )$p[1],
+      error = function(e) 0
+    )
+    curp <- ifelse(is.na(curp), 0, curp)
+    cap <- s$max_per_student - spent - curp
+    pmax(0, as.numeric(cap))
+  }
+
+  # snap to slider step (and coerce nonnegative)
+  snap_to_step <- function(x, step) {
+    x <- suppressWarnings(as.numeric(x))
+    if (!is.finite(x) || x < 0) return(0)
+    round(x / step) * step
+  }
+
   is_open <- function(x) isTRUE(as.logical(x))
 
   output$whoami <- renderUI({
@@ -535,37 +560,6 @@ server <- function(input, output, session) {
         "You have pledged all your points."
       } else {
         sprintf("Cap this round: %g.", cap)
-      })
-    )
-  })
-
-  output$admin_student_sliders <- renderUI({
-    req(is_admin())
-    st <- current_state()
-    s  <- current_settings()
-
-    users <- DBI::dbGetQuery(db, "SELECT user_id, display_name FROM users WHERE is_admin=0;")
-
-    tagList(
-      h5("Adjust or pledge for students"),
-      lapply(seq_len(nrow(users)), function(i) {
-        uid <- users$user_id[i]
-        nm  <- users$display_name[i]
-        fluidRow(
-          column(5, strong(nm)),
-          column(5, sliderInput(
-            paste0("admin_slider_", uid),
-            label = NULL,
-            min = 0,
-            max = s$max_per_student,
-            step = s$slider_step,
-            value = 0
-          )),
-          column(2,
-            actionButton(paste0("admin_give_", uid), "Add", class="btn-success btn-sm"),
-            actionButton(paste0("admin_pledge_", uid), "Pledge", class="btn-primary btn-sm")
-          )
-        )
       })
     )
   })
@@ -674,7 +668,29 @@ server <- function(input, output, session) {
       ),
       admin_pledges_upload_ui,
       h5("Pledges this round"),
-      uiOutput("admin_student_sliders"),    # 👈 add here
+      wellPanel(
+        h5("Adjust / pledge for a student"),
+        fluidRow(
+          column(4,
+            selectInput("admin_target_user", "Student",
+              choices = {
+                us <- DBI::dbGetQuery(db, "SELECT user_id, display_name FROM users WHERE is_admin=0 ORDER BY display_name;")
+                setNames(us$user_id, us$display_name)
+              }
+            ),
+            htmlOutput("admin_target_info")   # remaining cap etc.
+          ),
+          column(4,
+            numericInput("admin_amount", "Amount",
+              value = 0, min = 0, step = current_settings()$slider_step)
+          ),
+          column(4, br(),
+            actionButton("admin_do_pledge", "Pledge for student", class = "btn-primary"),
+            tags$span(" "),
+            actionButton("admin_do_add",    "Add points", class = "btn-success")
+          )
+        )
+      )
       tags$hr(),
       textAreaInput("admin_question", "Question (revealed only if cost is met):",
                     value = title_from_html(QUESTIONS[[min(current_state()$unlocked_units + 1L, length(QUESTIONS))]]),
@@ -733,41 +749,94 @@ server <- function(input, output, session) {
     )
   })
 
-  # dynamic observers for each student's sliders
-  observe({
-    req(is_admin())
-    users <- DBI::dbGetQuery(db, "SELECT user_id FROM users WHERE is_admin=0;")
+  # live display of remaining cap & current pledge for selected student
+  output$admin_target_info <- renderUI({
+    req(is_admin(), input$admin_target_user)
+    s  <- current_settings()
     st <- current_state()
+    uid <- input$admin_target_user
 
-    lapply(users$user_id, function(uid) {
+    cap <- remaining_cap_for(uid)
 
-      # --- Add points (top-up)
-      observeEvent(input[[paste0("admin_give_", uid)]], {
-        val <- as.numeric(input[[paste0("admin_slider_", uid)]])
-        if (!is.na(val) && val > 0) {
-          # Create a “gift” record in charges table (negative amount = refund)
-          DBI::dbExecute(db,
-            "INSERT INTO charges(user_id, round, amount)
-            VALUES(?, 9998, ?)
-            ON CONFLICT(user_id, round) DO UPDATE SET amount = amount + excluded.amount;",
-            params = list(uid, -val)
-          )
-          showNotification(glue("Added {val} points to {uid}."), type="message")
-          bump_admin()
-        }
-      }, ignoreInit = TRUE)
+    curp <- tryCatch(
+      DBI::dbGetQuery(db,
+        "SELECT COALESCE(pledge,0) AS p FROM pledges WHERE user_id=? AND round=?;",
+        params = list(uid, st$round))$p[1],
+      error = function(e) 0
+    ); curp <- ifelse(is.na(curp), 0, curp)
 
-      # --- Pledge for them
-      observeEvent(input[[paste0("admin_pledge_", uid)]], {
-        val <- as.numeric(input[[paste0("admin_slider_", uid)]])
-        if (!is.na(val) && val > 0) {
-          upsert_pledge(uid, st$round, val, name=NULL)
-          showNotification(glue("Pledged {val} points for {uid}."), type="message")
-          bump_admin()
-        }
-      }, ignoreInit = TRUE)
-    })
+    HTML(sprintf(
+      "<div>
+        <b>Round:</b> %d<br/>
+        <b>Remaining cap:</b> %.2f (cannot pledge beyond this)<br/>
+        <b>Current pledge this round:</b> %.2f<br/>
+        <b>Step size:</b> %.2f
+      </div>",
+      st$round, cap, curp, s$slider_step
+    ))
   })
+
+  # sanitize admin_amount on change: snap to step and not exceed remaining cap
+  observeEvent(list(input$admin_amount, input$admin_target_user), {
+    req(is_admin(), input$admin_target_user)
+    s <- current_settings()
+    step <- s$slider_step
+    uid  <- input$admin_target_user
+    cap  <- remaining_cap_for(uid)
+
+    amt  <- snap_to_step(input$admin_amount, step)
+    if (is.na(amt)) amt <- 0
+    if (amt > cap) amt <- cap
+    if (!identical(amt, input$admin_amount)) {
+      updateNumericInput(session, "admin_amount", value = amt)
+    }
+  }, ignoreInit = FALSE)
+
+  # Pledge on behalf of student
+  observeEvent(input$admin_do_pledge, {
+    req(is_admin(), input$admin_target_user)
+    s   <- current_settings()
+    uid <- input$admin_target_user
+    amt <- snap_to_step(input$admin_amount, s$slider_step)
+    cap <- remaining_cap_for(uid)
+
+    if (amt <= 0) {
+      showNotification("Amount must be > 0.", type="warning"); return()
+    }
+    if (amt > cap + 1e-9) {
+      showNotification("Amount exceeds remaining cap.", type="error"); return()
+    }
+    st <- current_state()
+    upsert_pledge(uid, st$round, amt, name = NULL)
+    showNotification(glue::glue("Pledged {amt} points for {uid}."), type="message")
+
+    # heartbeat so everyone refreshes
+    DBI::dbExecute(db, "UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
+    bump_admin(); rv$my_submission_pulse <- rv$my_submission_pulse + 1L
+  }, ignoreInit = TRUE)
+
+  # Add points (increase capacity immediately via a negative 'charge' record)
+  observeEvent(input$admin_do_add, {
+    req(is_admin(), input$admin_target_user)
+    s   <- current_settings()
+    uid <- input$admin_target_user
+    amt <- snap_to_step(input$admin_amount, s$slider_step)
+    if (amt <= 0) {
+      showNotification("Amount must be > 0.", type="warning"); return()
+    }
+    # Negative 'charge' adds back capacity (round 9998 reserved for admin gifts)
+    DBI::dbExecute(db,
+      "INSERT INTO charges(user_id, round, amount)
+      VALUES(?, 9998, ?)
+      ON CONFLICT(user_id, round) DO UPDATE SET amount = amount + excluded.amount;",
+      params = list(uid, -amt)
+    )
+    showNotification(glue::glue("Added {amt} points to {uid}."), type="message")
+
+    DBI::dbExecute(db, "UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
+    bump_admin(); bump_round()
+  }, ignoreInit = TRUE)
+
 
 
   # ---- Projector view
