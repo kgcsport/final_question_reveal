@@ -212,9 +212,11 @@ init_db <- function() {
   }
   ngs <- db_query("SELECT COUNT(*) n FROM game_state WHERE id=1;")$n[1]
   if (is.na(ngs) || ngs == 0) {
-    db_exec(glue("
-      INSERT INTO game_state(id, round, round_open, carryover, unlocked_units, scale_factor, question_text, started_at)
-      VALUES(1, 1, 0, 0, 0, NULL, {DBI::dbQuoteString(db, as.character(QUESTIONS[[1]]))}, NULL);"))
+    db_exec(
+     "INSERT INTO game_state(id, round, round_open, carryover, unlocked_units, scale_factor, question_text, started_at)
+       VALUES(1, 1, 0, 0, 0, NULL, ?, NULL);",
+      params = list(as.character(QUESTIONS[[1]]))
+    )
   }
 
   # Upsert users from CRED
@@ -232,7 +234,7 @@ logf("Database initialized.")
 # Convenience getters/setters with SAFE defaults
 blank_settings <- function() tibble(
   id=1, cost=24, max_per_student=7.5, slider_step=0.5,
-  max_for_student=100, round_timeout_sec=NA_real_, shortfall_policy="bank_all"
+   max_for_admin=100, round_timeout_sec=NA_real_, shortfall_policy="bank_all"
 )
 
 blank_state <- function() tibble(
@@ -560,12 +562,20 @@ server <- function(input, output, session) {
   # ---- My submissions + history
   output$my_submissions <- renderDT({
     req(authed())
+
     df <- tryCatch(
-      db_query("SELECT round, ? AS name, pledge, charged, when_ts AS 'when' FROM pledges WHERE user_id=? ORDER BY round DESC;",
-                      params = list(dispname(), user_id())),
-      error = function(e) tibble(round=integer(), name=character(), pledge=numeric(), charged=double(), when=character())
-    )
-    DT::datatable(df, options = list(pageLength=5), rownames = FALSE)
+      db_query(
+        "SELECT round, pledge, charged, when_ts AS 'when'
+        FROM pledges WHERE user_id=? ORDER BY round DESC;",
+        params = list(user_id())
+      ),
+      error = function(e) tibble::tibble()
+    ) |>
+    tibble::as_tibble() |>
+    dplyr::mutate(name = dispname()) |>
+    dplyr::select(dplyr::any_of(c("round","name","pledge","charged","when")))
+
+    DT::datatable(df, options = list(pageLength = 5), rownames = FALSE)
   })
 
   output$my_history_table <- DT::renderDT({
@@ -949,11 +959,11 @@ server <- function(input, output, session) {
     ws <- wtp_summary()
 
     if (identical(s$shortfall_policy, "bank_all")) {
-      charge_round_bank_all(st$round, ws$units_now, s$cost)
+      charge_round_bank_all(st$round)
       set_state(scale_factor = 1)
     } else {
       if (ws$units_now > 0) {
-        charge_round_bank_all(st$round, ws$units_now, s$cost)
+        charge_round_bank_all(st$round)
         set_state(scale_factor = 1)
       } else {
         db_exec("DELETE FROM charges WHERE round = ?;", list(st$round))
@@ -1002,6 +1012,7 @@ server <- function(input, output, session) {
     if (!isTRUE(is_admin())) return(NULL)
     if (!is.null(input$upload_pledges)) tags$span(style="color:green;", paste0("Imported: ", input$upload_pledges$name))
   })
+
   observeEvent(input$upload_pledges, {
     req(is_admin())
     finfo <- input$upload_pledges
@@ -1009,59 +1020,86 @@ server <- function(input, output, session) {
       showNotification("Please upload a CSV file.", type = "error"); return()
     }
 
-    pledges_df <- tryCatch(
-      readr::read_csv(finfo$datapath, show_col_types = FALSE),
-      error = function(e) NULL
-    )
+    pledges_df <- tryCatch(readr::read_csv(finfo$datapath, show_col_types = FALSE),
+                          error = function(e) NULL)
 
-    # Expect these columns (extra columns are OK)
     need_cols <- c("round","user_id","name","pledge","charged","when")
     if (is.null(pledges_df) || !all(need_cols %in% names(pledges_df))) {
       showNotification("Failed to upload: required columns missing.", type = "error"); return()
     }
 
-    # Coerce types defensively
-    pledges_df <- pledges_df |>
-      dplyr::mutate(
-        round  = as.integer(round),
-        pledge = suppressWarnings(as.numeric(pledge)),
-        charged = suppressWarnings(as.numeric(charged))
-      )
+    # ---- Hard coercions to base types (avoid S4/S3 surprises) ----
+    # Make a shallow copy to avoid tibble subclass quirks
+    pledges_df <- as.data.frame(pledges_df, stringsAsFactors = FALSE)
+
+    # Coerce columns; suppressWarnings only around numeric parsing
+    pledges_df$user_id <- as.character(pledges_df$user_id)
+    pledges_df$name    <- as.character(pledges_df$name)
+    pledges_df$round   <- suppressWarnings(as.integer(pledges_df$round))
+    pledges_df$pledge  <- suppressWarnings(as.numeric(pledges_df$pledge))
+    pledges_df$charged <- suppressWarnings(as.numeric(pledges_df$charged))
+
+    # Normalizations
+    pledges_df$name[is.na(pledges_df$name)] <- ""
+    # (optional) Treat missing charged as 0
+    # pledges_df$charged[is.na(pledges_df$charged)] <- 0
+
+    # Filter obviously bad rows early
+    pledges_df <- subset(pledges_df, !is.na(user_id) & nzchar(user_id) & !is.na(round))
 
     pool::poolWithTransaction(get_con(), function(con){
 
-      # 1) Upsert users
+      # 1) Upsert users (character, character)
       purrr::pwalk(pledges_df[, c("user_id","name")], function(user_id, name){
-        db_exec("INSERT INTO users(user_id, display_name) VALUES(?,?)
-          ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name;", params = list(user_id, name), con=con)
+        DBI::dbExecute(
+          con,
+          "INSERT INTO users(user_id, display_name)
+          VALUES(?,?)
+          ON CONFLICT(user_id) DO UPDATE SET display_name = excluded.display_name;",
+          params = list(as.character(user_id), as.character(name))
+        )
       })
 
-      # 2) Upsert pledges
+      # 2) Upsert pledges (character, integer, numeric)
       purrr::pwalk(pledges_df[, c("user_id","round","pledge")], function(user_id, round, pledge){
         if (!is.na(round) && !is.na(pledge)) {
-          db_exec("INSERT INTO pledges(user_id, round, pledge, when_ts) VALUES(?,?,?,CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id, round) DO UPDATE SET pledge=excluded.pledge, when_ts=CURRENT_TIMESTAMP;", params = list(user_id, round, pledge), con=con)
+          DBI::dbExecute(
+            con,
+            "INSERT INTO pledges(user_id, round, pledge, when_ts)
+            VALUES(?,?,?,CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, round)
+            DO UPDATE SET pledge = excluded.pledge, when_ts = CURRENT_TIMESTAMP;",
+            params = list(as.character(user_id), as.integer(round), as.numeric(pledge))
+          )
         }
       })
 
-      # 3) Optional charges
-      if (!all(is.na(pledges_df$charged))) {
+      # 3) Optional charges (character, integer, numeric)
+      if (!isTRUE(all(is.na(pledges_df$charged)))) {
         purrr::pwalk(pledges_df[, c("user_id","round","charged")], function(user_id, round, charged){
           if (!is.na(charged) && charged != 0 && !is.na(round)) {
-            db_exec("INSERT INTO charges(user_id, round, amount) VALUES(?,?,?)
-              ON CONFLICT(user_id, round) DO UPDATE SET amount=excluded.amount;", params = list(user_id, round, charged), con=con)
+            DBI::dbExecute(
+              con,
+              "INSERT INTO charges(user_id, round, amount)
+              VALUES(?,?,?)
+              ON CONFLICT(user_id, round) DO UPDATE SET amount = excluded.amount;",
+              params = list(as.character(user_id), as.integer(round), as.numeric(charged))
+            )
           }
         })
       }
     })
-    # AFTER the transaction, bump heartbeat so reactivePoll wakes up:
+
+    # Heartbeat + recompute state (reuse your helper)
     touch_heartbeat()
 
     ws <- wtp_summary()
-    set_state(unlocked_units = as.integer(floor(ws$effective_total / ws$cost)),
-              carryover      = ws$effective_total - as.integer(floor(ws$effective_total / ws$cost)) * ws$cost)
+    units_now <- as.integer(floor(ws$effective_total / ws$cost))
+    new_carry <- ws$effective_total - units_now * ws$cost
+    set_state(unlocked_units = units_now, carryover = new_carry)
+
     touch_heartbeat()
-    showNotification("Prior pledges uploaded and set.", type="message")
+    showNotification("Prior pledges uploaded and set.", type = "message")
     bump_admin(); bump_round()
   })
 
