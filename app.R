@@ -312,6 +312,12 @@ charge_round_bank_all <- function(round, spend_units, cost){
   })
 }
 
+get_con <- function() {
+  if (inherits(db, "pool") && !pool::poolClosed(db)) return(db)
+  logf("Reopening DB pool...")
+  pool::dbPool(RSQLite::SQLite(), dbname = db_path)
+}
+
 refund_carryover_proportionally <- function(carry){
   if (carry <= 0) return(invisible(FALSE))
   tc <- DBI::dbGetQuery(db, "SELECT user_id, COALESCE(SUM(amount),0) AS charged FROM charges GROUP BY user_id;")
@@ -365,7 +371,6 @@ ui <- fluidPage(
 # Server
 # -------------------------
 server <- function(input, output, session) {
-  session$onSessionEnded(function() pool::poolClose(db))   # FIX
 
   rv <- reactiveValues(
     authed = FALSE,
