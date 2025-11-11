@@ -140,6 +140,12 @@ q_user_round <- function(uid, r) db_query("SELECT COALESCE(pledge,0) AS p
 
 logf("Setting up database connection...")
 db_path <- file.path(safe_data_dir(), "appdata.sqlite")
+logf(sprintf("DB PATH: %s", db_path))
+observe({
+  n <- tryCatch(db_query("SELECT COUNT(*) AS n FROM pledges")$n[1], error=function(e) NA_integer_)
+  logf(sprintf("pledges rowcount now: %s", as.character(n)))
+})
+
 db <- pool::dbPool(RSQLite::SQLite(), dbname = db_path)
 
 # FIX: reliability PRAGMAs
