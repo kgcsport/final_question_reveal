@@ -82,17 +82,16 @@ title_from_html <- function(x) {
 # SQLite connection + schema (HARDENED)
 # -------------------------
 
-safe_data_dir <- function() {
+app_data_dir <- function() {
+  # CONNECT_CONTENT_DIR is set by Posit Connect for the app’s content directory
   d <- Sys.getenv("CONNECT_CONTENT_DIR", "")
-  if (nzchar(d)) {
-    d <- file.path(d, "data")
-  } else {
-    d <- tryCatch(tools::R_user_dir("finalquestion", "data"), error = function(e) "")
-    if (!nzchar(d)) d <- file.path(tempdir(), "finalquestion")
-  }
+  if (!nzchar(d)) d <- getwd()
+  d <- file.path(d, "data")
   if (!dir.exists(d)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
-  d
+  normalizePath(d, mustWork = FALSE)
 }
+db_path <- file.path(app_data_dir(), "appdata.sqlite")
+logf(sprintf("DB PATH: %s", db_path))
 
 # --- DB helpers (DRY all DBI:: calls) ---
 
@@ -139,7 +138,7 @@ q_user_round <- function(uid, r) db_query("SELECT COALESCE(pledge,0) AS p
                                            list(uid, as.integer(r)))
 
 logf("Setting up database connection...")
-db_path <- file.path(safe_data_dir(), "appdata.sqlite")
+db_path <- file.path(app_data_dir(), "appdata.sqlite")
 logf(sprintf("DB PATH: %s", db_path))
 observe({
   n <- tryCatch(db_query("SELECT COUNT(*) AS n FROM pledges")$n[1], error=function(e) NA_integer_)
@@ -155,8 +154,8 @@ try({
   db_exec("PRAGMA busy_timeout=5000;")
 }, silent = TRUE)
 
-# Close pool on session end & process exit
-reg.finalizer(environment(), function(e) try(pool::poolClose(db), silent = TRUE), onexit = TRUE)
+# OK to omit entirely on Connect; if you keep it:
+reg.finalizer(.GlobalEnv, function(e) try(pool::poolClose(db), silent = TRUE), onexit = TRUE)
 
 logf("Initializing database...")
 init_db <- function() {
