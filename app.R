@@ -82,37 +82,69 @@ title_from_html <- function(x) {
 # SQLite connection + schema (HARDENED)
 # -------------------------
 
-app_data_dir <- function() {
-  # CONNECT_CONTENT_DIR is set by Posit Connect for the app’s content directory
-  d <- Sys.getenv("CONNECT_CONTENT_DIR", "")
-  if (!nzchar(d)) d <- getwd()
-  d <- file.path(d, "data")
-  if (!dir.exists(d)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
-  normalizePath(d, mustWork = FALSE)
-}
+app_data_dir <- local({
+  dir_created <- FALSE
+  function() {
+    # Prefer Connect’s content dir; fallback to getwd()
+    root <- Sys.getenv("CONNECT_CONTENT_DIR", unset = getwd())
+    d <- file.path(root, "data")
+    if (!dir.exists(d)) {
+      # Create once, guard against races
+      ok <- try(dir.create(d, recursive = TRUE, showWarnings = FALSE), silent = TRUE)
+      # Verify existence after create attempt
+      if (!dir.exists(d)) stop(sprintf("Cannot create data dir: %s", d))
+    }
+    normalizePath(d, winslash = "/", mustWork = TRUE)
+  }
+})
+
 db_path <- file.path(app_data_dir(), "appdata.sqlite")
 logf(sprintf("DB PATH: %s", db_path))
 
 # --- DB helpers (DRY all DBI:: calls) ---
+new_pool <- function() {
+  pool::dbPool(
+    drv = RSQLite::SQLite(),
+    dbname = db_path,
+    journal_mode = "WAL",         # many readers + few writers
+    busy_timeout = 5000,          # wait up to 5s for locks
+    synchronous = NULL            # <- suppress “couldn't set synchronous” attempts
+    # cache_size = 100000         # optional: ~100MB page cache
+  )
+}
 
-get_con <- local({
-  cached <- NULL
-  function() {
-    # reuse cached if alive
-    if (inherits(cached, "pool") && !pool::poolClosed(cached)) return(cached)
-    # reuse global db if alive (don’t overwrite it)
-    if (exists("db", inherits = TRUE) &&
-        inherits(db, "pool") && !pool::poolClosed(db)) {
-      cached <<- db
-      # logf("Reusing global DB pool.")
-      return(cached)
+cached_poll <- function(interval_ms, session, check_sql, value_sql, default_df) {
+  cache <- shiny::reactiveVal(default_df)
+
+  shiny::reactivePoll(
+    interval_ms, session,
+    checkFunc = function() {
+      res <- try(db_query(check_sql), silent = TRUE)
+      # Always return a string; if fail, force a change so the poll ticks
+      if (inherits(res, "try-error") || !is.data.frame(res) || !nrow(res)) {
+        as.character(Sys.time())
+      } else {
+        as.character(res[[1]][1])
+      }
+    },
+    valueFunc = function() {
+      val <- try(db_query(value_sql), silent = TRUE)
+      if (!inherits(val, "try-error") && is.data.frame(val) && nrow(val)) cache(val)
+      cache()
     }
-    # ONLY here do we create a fresh pool (nothing alive)
-    # logf("Reopening DB pool...")
-    cached <<- pool::dbPool(RSQLite::SQLite(), dbname = db_path)
-    cached
-  }
-})
+  )
+}
+
+db <- NULL
+
+get_con <- function() {
+  if (inherits(db, "pool") && !pool::poolClosed(db)) return(db)
+  # logf("Creating DB pool...")
+  # Ensure the directory still exists (app could have restarted)
+  app_data_dir()
+  db <<- new_pool()
+  db
+}
 
 # Default to global pool unless a connection/pool is explicitly passed
 db_exec <- function(sql, params = NULL, con = NULL) {
@@ -145,9 +177,6 @@ observe({
   logf(sprintf("pledges rowcount now: %s", as.character(n)))
 })
 
-db <- pool::dbPool(RSQLite::SQLite(), dbname = db_path)
-
-# FIX: reliability PRAGMAs
 try({
   db_exec("PRAGMA journal_mode=WAL;")
   db_exec("PRAGMA synchronous=NORMAL;")
@@ -308,26 +337,33 @@ user_cumulative_charged <- function(user_id){
 
 charge_round_bank_all <- function(rnd) {
   pool::poolWithTransaction(get_con(), function(con){
-    db_exec("DELETE FROM charges WHERE round = ?;", params = list(as.integer(rnd)), con=con)
-    db_exec("INSERT INTO charges(user_id, round, amount)
-       SELECT user_id, round, pledge FROM pledges WHERE round = ?;", params = list(as.integer(rnd)), con=con)
+    DBI::dbExecute(con, "DELETE FROM charges WHERE round = ?;", params = list(as.integer(rnd)))
+    DBI::dbExecute(con, "INSERT INTO charges(user_id, round, amount)
+       SELECT user_id, round, pledge FROM pledges WHERE round = ?;", params = list(as.integer(rnd)))
   })
 }
 
 .compute_wtp <- function(st, s) {
-  # pledged this round from DB
+  # protect numerics
+  cost      <- as.numeric(s$cost %||% 24)
+  carryover <- as.numeric(st$carryover %||% 0)
+
   rt <- db_query("SELECT COALESCE(SUM(pledge),0) AS pledged
-                  FROM pledges WHERE round = ?;", params = list(as.integer(st$round)))
-  pledged <- rt$pledged[1]
-  eff <- pledged + st$carryover
-  units <- as.integer(floor(eff / s$cost))
+                  FROM pledges WHERE round = ?;",
+                params = list(as.integer(st$round)))
+  pledged <- as.numeric(rt$pledged[1] %||% 0)
+
+  eff   <- pledged + carryover
+  units <- as.integer(floor(eff / cost))
+  carry <- max(0, eff - units * cost)
+
   list(
     pledged = pledged,
-    carryover = st$carryover,
-    cost = s$cost,
+    carryover = carryover,
+    cost = cost,
     effective_total = eff,
     units_now = units,
-    carryforward = max(0, eff - units * s$cost)
+    carryforward = carry
   )
 }
 
@@ -408,6 +444,10 @@ server <- function(input, output, session) {
   bump_admin <- function() rv$admin_pulse <<- rv$admin_pulse + 1L
   bump_round <- function() rv$round_pulse <<- rv$round_pulse + 1L
 
+  # Session-scoped caches
+  pledge_max_frozen <- reactiveVal(NULL)   # numeric, per session, per round
+  my_pledge_tick    <- reactiveVal(0L)     # bump to refresh student-only views
+
   output$authed <- reactive(rv$authed)
   outputOptions(output, "authed", suspendWhenHidden = FALSE)
 
@@ -433,25 +473,34 @@ server <- function(input, output, session) {
   is_admin <- reactive(rv$is_admin)
 
   # ---- reactivePoll heartbeats (HARDENED)
-  settings_poll <- reactivePoll(
-    2000, session,
-    checkFunc = function() {
-      out <- try(db_query("SELECT updated_at FROM game_state WHERE id=1;"), silent = TRUE)
-      if (inherits(out, "try-error") || !is.data.frame(out) || nrow(out) == 0) {
-        as.character(Sys.time())  # force a tick; we'll serve defaults below
-      } else {
-        out$updated_at[1] %||% as.character(Sys.time())
-      }
-    },
-    valueFunc = function() {
-      s  <- get_settings()
-      st <- get_state()
-      list(settings = s, state = st)
-    }
+  # defaults if first read fails
+  .settings_default <- data.frame(
+    id = 1L, cost = 24, max_per_student = 7.5, slider_step = 0.5,
+    max_for_admin = 100, round_timeout_sec = NA_real_,
+    shortfall_policy = "bank_all", stringsAsFactors = FALSE
   )
 
-  current_settings <- reactive(settings_poll()$settings)
-  current_state    <- reactive(settings_poll()$state)
+  .state_default <- data.frame(
+    id = 1L, round = 1L, round_open = 0L, carryover = 0,
+    unlocked_units = 0L, scale_factor = NA_real_,
+    question_text = as.character(QUESTIONS[[1]]),
+    started_at = NA_character_, updated_at = as.character(Sys.time()),
+    stringsAsFactors = FALSE
+  )
+
+  current_settings <- cached_poll(
+    2000, session,
+    "SELECT updated_at FROM game_state WHERE id=1;",
+    "SELECT * FROM settings WHERE id=1;",
+    .settings_default
+  )
+
+  current_state <- cached_poll(
+    2000, session,
+    "SELECT updated_at FROM game_state WHERE id=1;",
+    "SELECT * FROM game_state WHERE id=1;",
+    .state_default
+  )
 
   # ---- Helpers
   remaining_cap_for <- function(uid) {
@@ -486,7 +535,6 @@ server <- function(input, output, session) {
     uiOutput("whoami"),
     tags$hr(),
     uiOutput("pledge_ui"),
-    actionButton("submit_pledge", "Submit pledge", class = "btn-primary"),
     tags$small(" You can update your pledge any time while the round is open."),
     tags$hr(),
     h5("Round progress"),
@@ -545,45 +593,85 @@ server <- function(input, output, session) {
   })
 
   # ---- Pledge UI
+  # helper to read this student's current pledge for the round
+  my_current_pledge <- function(st) {
+    res <- try(db_query(
+      "SELECT pledge FROM pledges WHERE user_id = ? AND round = ?;",
+      params = list(user_id(), as.integer(st$round))
+    ), silent = TRUE)
+    if (inherits(res, "try-error") || !nrow(res)) 0 else as.numeric(res$pledge[1])
+  }
+
   output$pledge_ui <- renderUI({
-    st <- current_state(); s <- current_settings()
-    cap <- if (is_admin()) s$max_for_admin else remaining_cap_for(user_id())
-    cur <- isolate(if (is.null(input$pledge)) 0 else as.numeric(input$pledge))
-    val <- min(cur, cap)
+    req(authed())
+    st <- current_state()
+    s  <- current_settings()
+
+    # frozen slider max (fallback to policy cap)
+    slider_max <- if_else(is_admin(), as.numeric(s$max_for_admin), pledge_max_frozen() %||% as.numeric(s$max_per_student))
+    slider_step <- as.numeric(s$slider_step)
+
+    # current value = current pledge (or 0)
+    cur <- my_current_pledge(st)
+
     tagList(
-      sliderInput("pledge", "Your pledge for THIS round:", min=0, max=cap, value=val, step=s$slider_step),
-      tags$small(if (is_admin()) {
-        "You are an admin, so you can pledge any amount (up to admin cap)."
-      } else if (st$round == 1) {
-        sprintf("This is your first round. You have %g points to spend.", s$max_per_student)
-      } else if (cap == 0) {
-        "You have pledged all your points."
-      } else {
-        sprintf("Cap this round: %g.", cap)
-      })
+      sliderInput("pledge_amt", "Your pledge this round:",
+        min = 0, max = slider_max, step = slider_step, value = cur),
+      actionButton("submit_pledge", "Submit / Update pledge", class = "btn btn-primary")
     )
   })
+
+  observeEvent(current_state()$round, {
+    # New round detected -> reset frozen max to policy cap
+    s <- current_settings()
+    pledge_max_frozen(as.numeric(s$max_per_student))
+  }, ignoreInit = FALSE)
 
   # ---- Submit pledge
   observeEvent(input$submit_pledge, {
     req(authed())
     st <- current_state()
-    if (!is_open(st$round_open)) {
-      showNotification("Pledging is currently closed.", type="warning")
-      return()
+    s  <- current_settings()
+
+    if (!isTRUE(st$round_open == 1)) {
+      showNotification("Round is closed; pledges are locked.", type = "error"); 
+      return(div(class = "text-muted", "Round is closed. Your pledge is locked."))
     }
-    s <- current_settings()
-    pledge <- as.numeric(input$pledge %||% 0)
-    pledge <- if (is_admin()) pmin(pmax(0, pledge), s$max_for_admin) else pmin(pmax(0, pledge), s$max_per_student)
-    upsert_pledge(user_id(), st$round, pledge, dispname())
-    rv$my_submission_pulse <- rv$my_submission_pulse + 1L
-    showNotification(glue("Pledge of {pledge} points submitted successfully."), type="message")
-    bump_admin()
+
+    raw <- as.numeric(input$pledge_amt %||% 0)
+    step <- as.numeric(s$slider_step %||% 0.5)
+    cap  <- if_else(is_admin(), as.numeric(s$max_for_admin), as.numeric(s$max_per_student %||% 7.5))
+
+    # snap to the step grid and clamp to [0, cap]
+    snap <- round(raw / step) * step
+    new_pledge <- max(0, min(cap, snap))
+
+    pool::poolWithTransaction(get_con(), function(con){
+      DBI::dbExecute(con,
+        "INSERT INTO pledges(user_id, round, pledge, when_ts)
+        VALUES(?,?,?,CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id, round)
+        DO UPDATE SET pledge = excluded.pledge, when_ts = CURRENT_TIMESTAMP;",
+        params = list(user_id(), as.integer(st$round), as.numeric(new_pledge))
+      )
+    })
+
+    # update this session’s slider value to reflect what actually got stored
+    updateSliderInput(session, "pledge_amt", value = new_pledge)
+
+    # refresh student-only and global views
+    my_pledge_tick(isolate(my_pledge_tick()) + 1L)
+    touch_heartbeat()
+
+    showNotification("Pledge saved.", type = "message")
   })
 
+
   # ---- My submissions + history
-  output$my_submissions <- renderDT({
+  output$my_submissions <- DT::renderDT({
     req(authed())
+    st <- current_state()   # ties to heartbeats/round changes
+    my_pledge_tick()        # bump on submit to force a re-render
 
     df <- tryCatch(
       db_query(
@@ -599,6 +687,7 @@ server <- function(input, output, session) {
 
     DT::datatable(df, options = list(pageLength = 5), rownames = FALSE)
   })
+
 
   output$my_history_table <- DT::renderDT({
     req(authed())
@@ -668,6 +757,7 @@ server <- function(input, output, session) {
         column(3, actionButton("next_round",  "Next round", class = "btn-primary")),
         column(3, actionButton("previous_round",  "Previous round", class = "btn-primary")),
         column(3, actionButton("reset_all",   "RESET all (keep roster)", class = "btn-outline-danger")),
+        column(3, actionButton("reset_current_round",   "RESET current round", class = "btn-outline-warning")),
         column(3, actionButton("end_game", "End game & redistribute", class="btn-warning"))
       ),
       wellPanel(
@@ -876,8 +966,8 @@ server <- function(input, output, session) {
   })
 
   wtp_summary <- reactive({
-    st <- current_state()      # <-- reactive (driven by your reactivePoll)
-    s  <- current_settings()   # <-- reactive
+    st <- current_state()
+    s  <- current_settings()
     .compute_wtp(st, s)
   })
 
@@ -966,7 +1056,6 @@ server <- function(input, output, session) {
     req(is_admin())
     st <- current_state()
     set_state(round_open = 1, scale_factor = NA, started_at = as.character(Sys.time()))
-    db_exec("DELETE FROM pledges WHERE round = ?;", params = list(st$round))
     showNotification(glue("Pledging is OPEN for round {st$round}. Carryover available: {st$carryover}."), type="message")
     bump_admin()
   })
@@ -1029,14 +1118,66 @@ server <- function(input, output, session) {
 
   observeEvent(input$reset_all, ignoreInit = TRUE, {
     req(is_admin())
-    db_exec("DELETE FROM pledges;")
-    db_exec("DELETE FROM charges;")
+
+    showModal(modalDialog(
+      title = "Confirm reset",
+      "Delete all pledges/charges for all rounds? This will reset the round counter to 1.",
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_reset_all", "Yes, reset", class = "btn btn-danger")
+      ),
+      easyClose = TRUE
+    ))
+  })
+
+  observeEvent(input$confirm_reset_all, {
+    removeModal()
+    pool::poolWithTransaction(get_con(), function(con){
+      DBI::dbExecute(con, "DELETE FROM pledges;")
+      DBI::dbExecute(con, "DELETE FROM charges;")
+    })
     set_state(unlocked_units = 0L, carryover = 0, round = 1, round_open = 0, scale_factor = NA,
               started_at = NA, question_text = as.character(QUESTIONS[[1]]))
     updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[1]]))
     showNotification("All rounds and pledges reset (roster kept).", type="error")
     bump_admin()
   })
+
+  observeEvent(input$reset_current_round, {
+    req(is_admin())
+    st <- current_state()
+    r  <- as.integer(st$round)
+
+    showModal(modalDialog(
+      title = "Confirm reset",
+      sprintf("This will delete all pledges/charges for round %d. Proceed?", r),
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_reset_current", "Yes, reset", class = "btn btn-danger")
+      ),
+      easyClose = TRUE
+    ))
+  })
+
+  observeEvent(input$confirm_reset_current, {
+    removeModal()
+    st <- current_state()
+    s  <- current_settings()
+    r  <- as.integer(st$round)
+
+    pool::poolWithTransaction(get_con(), function(con){
+      DBI::dbExecute(con, "DELETE FROM charges WHERE round = ?;", params = list(r))
+      DBI::dbExecute(con, "DELETE FROM pledges WHERE round = ?;", params = list(r))
+    })
+
+    # recompute the displayed state for *this* round
+    ws <- .compute_wtp(current_state(), current_settings())
+    set_state(unlocked_units = ws$units_now, carryover = ws$carryforward)
+
+    touch_heartbeat()
+    showNotification(sprintf("Round %d reset.", r), type = "message")
+  })
+
 
   output$upload_pledges_status <- renderUI({
     if (!isTRUE(is_admin())) return(NULL)
@@ -1050,7 +1191,7 @@ server <- function(input, output, session) {
       showNotification("Please upload a CSV file.", type = "error"); return()
     }
 
-    pledges_df <- tryCatch(readr::read_csv(finfo$datapath, show_col_types = FALSE),
+        pledges_df <- tryCatch(readr::read_csv(finfo$datapath, show_col_types = FALSE),
                           error = function(e) NULL)
 
     need_cols <- c("round","user_id","name","pledge","charged","when")
@@ -1123,11 +1264,12 @@ server <- function(input, output, session) {
     # Heartbeat + recompute state (reuse your helper)
     touch_heartbeat()
 
-    st <- current_state()
-    s <- current_settings()
-
+    st <- current_state(); s <- current_settings()
     ws <- .compute_wtp(st, s)
-    set_state(unlocked_units = ws$units_now, carryover = ws$carryforward)
+    set_state(
+      unlocked_units = st$unlocked_units + ws$units_now,
+      carryover      = ws$carryforward
+    )
 
     touch_heartbeat()
     showNotification("Prior pledges uploaded and set.", type = "message")
