@@ -52,3 +52,4 @@ rsconnect/
 shinycannon-1.2.0-85f280d.jar
 *.zip
 *.sqlite*
+google_application_credentials.json

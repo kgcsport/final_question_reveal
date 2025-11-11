@@ -3,12 +3,31 @@
 # ============================================================
 
 if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
-pacman::p_load(shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue)
+pacman::p_load(shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue, googlesheets4)
 
 `%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(as.character(a))) a else b
 
 options(shiny.sanitize.errors = FALSE)
 options(shiny.fullstacktrace = TRUE)
+
+# Load JSON key from environment
+if (Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS") == "") {
+  json_txt <- Sys.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+  if (nzchar(json_txt)) {
+    tf <- tempfile(fileext = ".json")
+    writeLines(json_txt, tf)
+    Sys.setenv(GOOGLE_APPLICATION_CREDENTIALS = tf)
+  }
+}
+
+# Authenticate non-interactively
+googlesheets4::gs4_auth(
+  path = Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+  scopes = c(
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+  )
+)
 
 # Log helper: writes to stderr (shows in Connect logs)
 logf <- function(...) cat(format(Sys.time()), "-", paste(..., collapse=" "), "\n", file=stderr())
@@ -50,6 +69,144 @@ CRED <- tryCatch(
   get_credentials(),
   error = function(e) { logf("Credential load error:", conditionMessage(e)); stop(e) }
 )
+
+# Back-up
+
+# Requires: googlesheets4, dplyr (already in your app)
+backup_to_gsheet <- function() {
+  # ---- 0) Pull raw data ---------------------------
+  s  <- tryCatch(db_query("SELECT * FROM settings WHERE id=1;"), error = function(e) NULL)
+  gs <- tryCatch(db_query("SELECT * FROM game_state WHERE id=1;"), error = function(e) NULL)
+  cost <- suppressWarnings(as.numeric(s$cost[1]))
+  if (!is.finite(cost)) cost <- 24
+
+  pledges_df <- tryCatch(db_query("SELECT user_id, round, pledge, charged, when_ts FROM pledges;"),
+                         error = function(e) NULL)
+  charges_df <- tryCatch(db_query("SELECT user_id, round, amount AS amount_charged, charged_at FROM charges;"),
+                         error = function(e) NULL)
+
+  if (is.null(pledges_df) || !nrow(pledges_df)) {
+    logf("Backup skipped: no pledges found.")
+    return(invisible(FALSE))
+  }
+
+  # ---- 1) Detailed sheet: pledges + charge markers -----------
+  # Left join charges to mark which pledges were charged and how much
+  det <- pledges_df
+  if (!is.null(charges_df) && nrow(charges_df)) {
+    det <- det |>
+      dplyr::left_join(charges_df, by = c("user_id","round"))
+  } else {
+    det$amount_charged <- NA_real_
+    det$charged_at     <- NA_character_
+  }
+
+  # Prefer explicit charges table; fallback to pledges.charged if used
+  det$charged_flag <- dplyr::coalesce(
+    as.numeric(det$amount_charged) > 0,
+    as.numeric(det$charged) > 0,
+    FALSE
+  )
+
+  # Stable column order
+  det <- det |>
+    dplyr::mutate(
+      round = as.integer(round),
+      pledge = as.numeric(pledge)
+    ) |>
+    dplyr::arrange(round, user_id) |>
+    dplyr::select(round, user_id, pledge, charged_flag, amount_charged, when_ts, charged_at)
+
+  # ---- 2) Round summary: unlocked this round & carryover -------
+  # We replay history round-by-round to compute unlocked & carry
+  sum_by_round <- det |>
+    dplyr::group_by(round) |>
+    dplyr::summarise(
+      sum_pledges   = sum(pledge, na.rm = TRUE),
+      n_pledgers    = dplyr::n_distinct(user_id),
+      charged_total = sum(dplyr::coalesce(amount_charged, 0), na.rm = TRUE),
+      n_charged     = sum(charged_flag, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::arrange(round)
+
+  carry_in  <- 0
+  unlocked_cum <- 0
+  summary_rows <- lapply(seq_len(nrow(sum_by_round)), function(i) {
+    r   <- sum_by_round$round[i]
+    sp  <- sum_by_round$sum_pledges[i]
+    eff <- carry_in + sp
+    unlocked_this <- as.integer(floor(eff / cost))
+    carry_out     <- eff - unlocked_this * cost
+    unlocked_cum  <<- unlocked_cum + unlocked_this
+
+    data.frame(
+      round               = r,
+      carry_in            = carry_in,
+      sum_pledges         = sp,
+      effective_total     = eff,
+      unlocked_this_round = unlocked_this,
+      carry_out           = carry_out,
+      unlocked_cumulative = unlocked_cum,
+      n_pledgers          = sum_by_round$n_pledgers[i],
+      n_charged           = sum_by_round$n_charged[i],
+      charged_total       = sum_by_round$charged_total[i],
+      cost                = cost,
+      stringsAsFactors = FALSE
+    )
+  })
+  summ <- do.call(rbind, summary_rows)
+
+  # Optional: snapshot current game_state, if present
+  gsnap <- NULL
+  if (!is.null(gs) && nrow(gs)) {
+    gsnap <- gs
+    # keep expected simple types for Sheets
+    for (nm in names(gsnap)) if (inherits(gsnap[[nm]], "POSIXt")) gsnap[[nm]] <- as.character(gsnap[[nm]])
+  }
+
+  # ---- 3) Write to Google Sheets (two tabs) ---------------------
+  sheet_name <- "FinalQuestion_Pledges_Backup"
+
+  tryCatch({
+    # Find or create the sheet
+    lib <- googlesheets4::gs4_find(sheet_name)
+    if (!nrow(lib)) {
+      ss_id <- googlesheets4::gs4_create(sheet_name)$spreadsheet_id
+    } else {
+      ss_id <- lib$id[1]
+    }
+
+    # Ensure tabs exist
+    existing_tabs <- tryCatch(googlesheets4::sheet_names(ss_id), error = function(e) character(0))
+    if (!"pledges" %in% existing_tabs) googlesheets4::sheet_add(ss_id, "pledges")
+    if (!"round_summary" %in% existing_tabs) googlesheets4::sheet_add(ss_id, "round_summary")
+    if (!is.null(gsnap) && !"game_state_snapshot" %in% existing_tabs) {
+      googlesheets4::sheet_add(ss_id, "game_state_snapshot")
+    }
+
+    # Clear + write (atomic enough for our use case)
+    googlesheets4::range_clear(ss_id, sheet = "pledges")
+    googlesheets4::sheet_write(det, ss = ss_id, sheet = "pledges")
+
+    googlesheets4::range_clear(ss_id, sheet = "round_summary")
+    googlesheets4::sheet_write(summ, ss = ss_id, sheet = "round_summary")
+
+    if (!is.null(gsnap)) {
+      googlesheets4::range_clear(ss_id, sheet = "game_state_snapshot")
+      googlesheets4::sheet_write(gsnap, ss = ss_id, sheet = "game_state_snapshot")
+    }
+
+    logf(sprintf(
+      "Backed up: %d pledge-rows; rounds=%d; unlocked_total=%d; carry=%0.2f",
+      nrow(det), nrow(summ), tail(summ$unlocked_cumulative, 1), tail(summ$carry_out, 1)
+    ))
+    TRUE
+  }, error = function(e) {
+    logf(paste("Backup failed:", e$message))
+    FALSE
+  })
+}
 
 # -------------------------
 # Questions (unchanged)
@@ -134,6 +291,159 @@ cached_poll <- function(interval_ms, session, check_sql, value_sql, default_df) 
     }
   )
 }
+
+recompute_state_from_pledges <- function(cost) {
+  P <- tryCatch(
+    db_query("SELECT round, COALESCE(SUM(pledge),0) AS pledged
+              FROM pledges GROUP BY round ORDER BY round;"),
+    error = function(e) data.frame()
+  )
+  if (!nrow(P)) return(list(unlocked = 0L, carry = 0))
+
+  carry <- 0
+  unlocked_total <- 0L
+  for (i in seq_len(nrow(P))) {
+    eff  <- carry + as.numeric(P$pledged[i])
+    units <- as.integer(floor(eff / cost))
+    carry <- eff - units * cost
+    unlocked_total <- unlocked_total + units
+  }
+  list(unlocked = unlocked_total, carry = carry)
+}
+
+# name_or_id: spreadsheet name ("FinalQuestion_Pledges_Backup") or ID
+restore_from_gsheet <- function(name_or_id = "FinalQuestion_Pledges_Backup",
+                                wipe_local = TRUE,
+                                prefer_sheet_cost = TRUE) {
+
+  # --- Find sheet
+  ss_id <- tryCatch({
+    # if it's already an ID, this will succeed; else find by name
+    if (grepl("^[a-zA-Z0-9-_]{20,}$", name_or_id)) name_or_id
+    else googlesheets4::gs4_find(name_or_id)$id[1]
+  }, error = function(e) NA_character_)
+
+  if (!nzchar(ss_id)) {
+    logf("Restore: sheet not found."); return(invisible(FALSE))
+  }
+
+  # --- Read tabs (pledges required)
+  tabs <- tryCatch(googlesheets4::sheet_names(ss_id), error = function(e) character(0))
+  if (!"pledges" %in% tabs) {
+    logf("Restore: 'pledges' tab not found."); return(invisible(FALSE))
+  }
+  pledges_df <- googlesheets4::read_sheet(ss_id, sheet = "pledges")
+  if (!nrow(pledges_df)) {
+    logf("Restore: pledges tab empty."); return(invisible(FALSE))
+  }
+
+  # optional tabs
+  summ_df <- if ("round_summary" %in% tabs)
+    tryCatch(googlesheets4::read_sheet(ss_id, sheet = "round_summary"),
+             error = function(e) NULL) else NULL
+  gsnap_df <- if ("game_state_snapshot" %in% tabs)
+    tryCatch(googlesheets4::read_sheet(ss_id, sheet = "game_state_snapshot"),
+             error = function(e) NULL) else NULL
+
+  # --- Decide cost
+  current_settings_df <- tryCatch(db_query("SELECT * FROM settings WHERE id=1;"),
+                                  error = function(e) NULL)
+  cost_db <- suppressWarnings(as.numeric(current_settings_df$cost[1]))
+  cost_sheet <- suppressWarnings(as.numeric(if (!is.null(summ_df)) summ_df$cost[1] else NA))
+  cost <- if (prefer_sheet_cost && is.finite(cost_sheet)) cost_sheet
+          else if (is.finite(cost_db)) cost_db
+          else 24
+
+  # --- Coerce columns
+  pledges_df <- as.data.frame(pledges_df, stringsAsFactors = FALSE)
+  need_cols <- c("round","user_id","pledge")
+  if (!all(need_cols %in% names(pledges_df))) {
+    logf("Restore: pledges sheet missing required columns: round, user_id, pledge.")
+    return(invisible(FALSE))
+  }
+  pledges_df$round  <- as.integer(pledges_df$round)
+  pledges_df$user_id <- as.character(pledges_df$user_id)
+  pledges_df$pledge <- suppressWarnings(as.numeric(pledges_df$pledge))
+  if (!"charged_flag" %in% names(pledges_df)) pledges_df$charged_flag <- FALSE
+  if (!"amount_charged" %in% names(pledges_df)) pledges_df$amount_charged <- NA_real_
+  if (!"when_ts" %in% names(pledges_df)) pledges_df$when_ts <- NA_character_
+  if (!"charged_at" %in% names(pledges_df)) pledges_df$charged_at <- NA_character_
+
+  # --- Write to DB inside one transaction
+  pool::poolWithTransaction(get_con(), function(con){
+    if (wipe_local) {
+      DBI::dbExecute(con, "DELETE FROM charges;")
+      DBI::dbExecute(con, "DELETE FROM pledges;")
+      # (optionally wipe users and repopulate from CRED + pledges)
+      # DBI::dbExecute(con, "DELETE FROM users;")
+    }
+
+    # Upsert users from pledges (fallback display_name = user_id)
+    u <- unique(pledges_df$user_id)
+    if (length(u)) {
+      purrr::walk(u, function(uid) {
+        DBI::dbExecute(con,
+          "INSERT INTO users(user_id, display_name)
+           VALUES(?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name;",
+          params = list(uid, uid))
+      })
+    }
+
+    # Upsert pledges
+    # keep only non-NA round and pledge
+    P <- pledges_df[!is.na(pledges_df$round) & !is.na(pledges_df$pledge), ]
+    if (nrow(P)) {
+      purrr::pwalk(P[, c("user_id","round","pledge","when_ts")], function(user_id, round, pledge, when_ts){
+        DBI::dbExecute(con,
+          "INSERT INTO pledges(user_id, round, pledge, when_ts)
+           VALUES(?,?,?,COALESCE(?, CURRENT_TIMESTAMP))
+           ON CONFLICT(user_id, round)
+           DO UPDATE SET pledge=excluded.pledge, when_ts=excluded.when_ts;",
+          params = list(user_id, as.integer(round), as.numeric(pledge), when_ts))
+      })
+    }
+
+    # Upsert charges (if present)
+    C <- pledges_df[!is.na(pledges_df$amount_charged) & pledges_df$amount_charged > 0, ]
+    if (nrow(C)) {
+      purrr::pwalk(C[, c("user_id","round","amount_charged","charged_at")], function(user_id, round, amount_charged, charged_at){
+        DBI::dbExecute(con,
+          "INSERT INTO charges(user_id, round, amount, charged_at)
+           VALUES(?,?,?,COALESCE(?, CURRENT_TIMESTAMP))
+           ON CONFLICT(user_id, round)
+           DO UPDATE SET amount=excluded.amount, charged_at=excluded.charged_at;",
+          params = list(user_id, as.integer(round), as.numeric(amount_charged), charged_at))
+      })
+    }
+
+    # Ensure settings + game_state rows exist
+    DBI::dbExecute(con,
+      "INSERT INTO settings(id, cost)
+       VALUES(1, ?)
+       ON CONFLICT(id) DO UPDATE SET cost=excluded.cost;",
+      params = list(cost))
+
+    DBI::dbExecute(con,
+      "INSERT INTO game_state(id, round, round_open, carryover, unlocked_units, scale_factor, question_text, started_at)
+       VALUES(1, 1, 0, 0, 0, NULL, NULL, NULL)
+       ON CONFLICT(id) DO NOTHING;")
+  })
+
+  # Recompute totals from DB pledges with decided cost
+  rec <- recompute_state_from_pledges(cost)
+
+  # Write final state (don’t re-open round here)
+  set_state(unlocked_units = rec$unlocked, carryover = rec$carry, round_open = 0L)
+  # Keep the cost we chose
+  set_settings(cost = cost)
+
+  touch_heartbeat()
+  logf(sprintf("Restore complete: unlocked=%d, carry=%.2f, cost=%.2f",
+               rec$unlocked, rec$carry, cost))
+  TRUE
+}
+
 
 db <- NULL
 
@@ -262,6 +572,7 @@ init_db <- function() {
   })
 }
 init_db()
+
 logf("Database initialized.")
 
 # Convenience getters/setters with SAFE defaults
@@ -798,7 +1109,22 @@ server <- function(input, output, session) {
       fluidRow(
         column(3, downloadButton("dl_pledges_csv", "Download pledges (CSV)")),
         column(3, downloadButton("dl_roster_csv",  "Download roster (CSV)"))
+      ),
+      h5("Backup / Restore"),
+      fluidRow(
+        column(5,
+          textInput("gs_restore_id",
+            "Sheet name or ID",
+            value = "FinalQuestion_Pledges_Backup",
+            placeholder = "Name or the long Google Sheets ID"
+          )
+        ),
+        column(3, br(), actionButton("restore_from_gs", "Restore from Google Sheets", class="btn-warning")),
+        column(4,
+          tags$small("Restores pledges (+charges if present) and recomputes unlocked/carry.")
+        )
       )
+
     )
   })
   output$admin_ui <- renderUI(admin_controls())
@@ -1093,6 +1419,7 @@ server <- function(input, output, session) {
         "Not funded — no one charged; no carryover added.",
       type = if (ws$units_now > 0) "message" else "warning"
     )
+    backup_to_gsheet()
     touch_heartbeat(); bump_admin()
   })
 
@@ -1140,6 +1467,7 @@ server <- function(input, output, session) {
               started_at = NA, question_text = as.character(QUESTIONS[[1]]))
     updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[1]]))
     showNotification("All rounds and pledges reset (roster kept).", type="error")
+    backup_to_gsheet()
     bump_admin()
   })
 
@@ -1191,7 +1519,7 @@ server <- function(input, output, session) {
       showNotification("Please upload a CSV file.", type = "error"); return()
     }
 
-        pledges_df <- tryCatch(readr::read_csv(finfo$datapath, show_col_types = FALSE),
+    pledges_df <- tryCatch(readr::read_csv(finfo$datapath, show_col_types = FALSE),
                           error = function(e) NULL)
 
     need_cols <- c("round","user_id","name","pledge","charged","when")
@@ -1273,7 +1601,27 @@ server <- function(input, output, session) {
 
     touch_heartbeat()
     showNotification("Prior pledges uploaded and set.", type = "message")
-    bump_admin(); bump_round()
+    backup_to_gsheet(); bump_admin(); bump_round()
+  })
+
+  observeEvent(input$restore_from_gs, {
+    req(is_admin())
+    ss <- input$gs_restore_id %||% "FinalQuestion_Pledges_Backup"
+
+    showNotification("Restoring…", type="message", duration = 2)
+    ok <- FALSE
+    msg <- NULL
+    try({
+      ok <- restore_from_gsheet(name_or_id = ss, wipe_local = TRUE, prefer_sheet_cost = TRUE)
+    }, silent = TRUE)
+
+    if (isTRUE(ok)) {
+      showNotification("Restore complete. State recomputed from sheet.", type="message")
+      touch_heartbeat();  # wake all sessions
+      bump_admin()
+    } else {
+      showNotification("Restore failed. Check sheet name/ID and auth.", type="error")
+    }
   })
 
   observeEvent(input$end_game, ignoreInit = TRUE, {
