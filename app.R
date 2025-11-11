@@ -1118,6 +1118,9 @@ server <- function(input, output, session) {
     # Heartbeat + recompute state (reuse your helper)
     touch_heartbeat()
 
+    st <- current_state()
+    s <- current_settings()
+
     ws <- .compute_wtp(st, s)
     set_state(unlocked_units = ws$units_now, carryover = ws$carryforward)
 
