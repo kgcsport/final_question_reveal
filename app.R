@@ -887,7 +887,7 @@ server <- function(input, output, session) {
     datatable(data, rownames = FALSE, options = list(dom='t', paging=FALSE, ordering=FALSE), colnames=c("", ""))
   })
 
-  round_df <- reactive({s
+  round_df <- reactive({
     st <- current_state()
     tryCatch(db_query("SELECT pledge FROM pledges WHERE round = ?;", params = list(st$round)),
              error = function(e) tibble(pledge = numeric()))
