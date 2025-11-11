@@ -117,12 +117,11 @@ get_con <- local({
 
 # Default to global pool unless a connection/pool is explicitly passed
 db_exec <- function(sql, params = NULL, con = NULL) {
-  conn <- con %||% get_con()
+  conn <- if (is.null(con)) get_con() else con
   DBI::dbExecute(conn, sql, params = params)
 }
-
 db_query <- function(sql, params = NULL, con = NULL) {
-  conn <- con %||% get_con()
+  conn <- if (is.null(con)) get_con() else con
   DBI::dbGetQuery(conn, sql, params = params)
 }
 
@@ -302,13 +301,31 @@ user_cumulative_charged <- function(user_id){
   )
 }
 
-charge_round_bank_all <- function(round) {
+charge_round_bank_all <- function(rnd) {
   pool::poolWithTransaction(get_con(), function(con){
-    db_exec("DELETE FROM charges WHERE round = ?;", params = list(round), con=con)
+    db_exec("DELETE FROM charges WHERE round = ?;", params = list(as.integer(rnd)), con=con)
     db_exec("INSERT INTO charges(user_id, round, amount)
-       SELECT user_id, round, pledge FROM pledges WHERE round = ?;", params = list(round), con=con)
+       SELECT user_id, round, pledge FROM pledges WHERE round = ?;", params = list(as.integer(rnd)), con=con)
   })
 }
+
+.compute_wtp <- function(st, s) {
+  # pledged this round from DB
+  rt <- db_query("SELECT COALESCE(SUM(pledge),0) AS pledged
+                  FROM pledges WHERE round = ?;", params = list(as.integer(st$round)))
+  pledged <- rt$pledged[1]
+  eff <- pledged + st$carryover
+  units <- as.integer(floor(eff / s$cost))
+  list(
+    pledged = pledged,
+    carryover = st$carryover,
+    cost = s$cost,
+    effective_total = eff,
+    units_now = units,
+    carryforward = max(0, eff - units * s$cost)
+  )
+}
+
 
 refund_carryover_proportionally <- function(carry){
   if (carry <= 0) return(invisible(FALSE))
@@ -644,6 +661,7 @@ server <- function(input, output, session) {
         column(3, actionButton("open_round",  "Open pledging", class = "btn-success")),
         column(3, actionButton("close_round", "Close pledging now", class = "btn-danger")),
         column(3, actionButton("next_round",  "Next round", class = "btn-primary")),
+        column(3, actionButton("previous_round",  "Previous round", class = "btn-primary")),
         column(3, actionButton("reset_all",   "RESET all (keep roster)", class = "btn-outline-danger")),
         column(3, actionButton("end_game", "End game & redistribute", class="btn-warning"))
       ),
@@ -852,27 +870,24 @@ server <- function(input, output, session) {
     )
   })
 
-  wtp_summary <- function(st = get_state(), s = get_settings()) {
-    rt <- round_totals(st$round)
-    effective_total <- rt$pledged + st$carryover
-    carryforward <- max(0, effective_total - s$cost)
-    units_now <- as.integer(floor(effective_total / s$cost))
-    new_carry <- effective_total - units_now * s$cost
-    list(pledged=rt$pledged, carryover=st$carryover,
-        effective_total=effective_total, carryforward=carryforward, cost=s$cost, units_now=units_now, new_carry=new_carry)
-  }
+  wtp_summary <- reactive({
+    st <- current_state()      # <-- reactive (driven by your reactivePoll)
+    s  <- current_settings()   # <-- reactive
+    .compute_wtp(st, s)
+  })
 
   output$wtp_total <- DT::renderDT({
-    s <- wtp_summary()
+    ws <- wtp_summary()
+    logf(sprintf("wtp_summary: pledged=%f, carryover=%f, effective_total=%f, cost=%f, units_now=%d, carryforward=%f", ws$pledged, ws$carryover, ws$effective_total, ws$cost, ws$units_now, ws$carryforward))
     data <- data.frame(
       Metric = c("This round pledged","Carryover","Effective total",
-                 sprintf("Carryforward (if over COST = %.2f)", s$cost)),
-      Value  = sprintf("%.2f", c(s$pledged, s$carryover, s$effective_total, s$carryforward))
+                 sprintf("Carryforward (if over COST = %.2f)", ws$cost)),
+      Value  = sprintf("%.2f", c(ws$pledged, ws$carryover, ws$effective_total, ws$carryforward))
     )
     datatable(data, rownames = FALSE, options = list(dom='t', paging=FALSE, ordering=FALSE), colnames=c("", ""))
   })
 
-  round_df <- reactive({
+  round_df <- reactive({s
     st <- current_state()
     tryCatch(db_query("SELECT pledge FROM pledges WHERE round = ?;", params = list(st$round)),
              error = function(e) tibble(pledge = numeric()))
@@ -972,14 +987,14 @@ server <- function(input, output, session) {
     }
 
     set_state(round_open = 0,
-              carryover  = ws$new_carry,
+              carryover  = ws$carryforward,
               unlocked_units = st$unlocked_units + ws$units_now)
 
     showNotification(
       if (ws$units_now > 0)
-        glue::glue("Purchased {ws$units_now} question(s). New carryover: {round(ws$new_carry, 2)}.")
+        glue::glue("Purchased {ws$units_now} question(s). New carryover: {round(ws$carryforward, 2)}.")
       else if (identical(s$shortfall_policy, "bank_all"))
-        glue::glue("Not funded — pledges banked. New carryover: {round(ws$new_carry, 2)}. At game over, carryover will be refunded proportionally.")
+        glue::glue("Not funded — pledges banked. New carryover: {round(ws$carryforward, 2)}. At game over, carryover will be refunded proportionally.")
       else
         "Not funded — no one charged; no carryover added.",
       type = if (ws$units_now > 0) "message" else "warning"
@@ -991,6 +1006,16 @@ server <- function(input, output, session) {
     req(is_admin())
     st <- current_state()
     new_round <- st$round + 1L
+    set_state(round = new_round, round_open = 0, scale_factor = NA, started_at = NA)
+    updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[new_round]]))
+    showNotification(glue("Moved to round {new_round}. Carryover available: {current_state()$carryover}."), type="message")
+    bump_admin()
+  })
+
+  observeEvent(input$previous_round, ignoreInit = TRUE, {
+    req(is_admin())
+    st <- current_state()
+    new_round <- st$round - 1L
     set_state(round = new_round, round_open = 0, scale_factor = NA, started_at = NA)
     updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[new_round]]))
     showNotification(glue("Moved to round {new_round}. Carryover available: {current_state()$carryover}."), type="message")
@@ -1093,10 +1118,8 @@ server <- function(input, output, session) {
     # Heartbeat + recompute state (reuse your helper)
     touch_heartbeat()
 
-    ws <- wtp_summary()
-    units_now <- as.integer(floor(ws$effective_total / ws$cost))
-    new_carry <- ws$effective_total - units_now * ws$cost
-    set_state(unlocked_units = units_now, carryover = new_carry)
+    ws <- .compute_wtp(st, s)
+    set_state(unlocked_units = ws$units_now, carryover = ws$carryforward)
 
     touch_heartbeat()
     showNotification("Prior pledges uploaded and set.", type = "message")
