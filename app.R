@@ -448,11 +448,13 @@ restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
   googledrive::drive_get(googledrive::as_id(folder_id))
 
   # Pick the file: use provided name or the most recent appdata_*.zip
-  fls <- googledrive::drive_ls(googledrive::as_id(folder_id))
+  id <- googledrive::drive_ls(googledrive::as_id(folder_id)) |>
+    dplyr::filter(name == filename) |>
+    pull(id)
   
   # Download
   zipfile <- file.path(tempdir(), filename)
-  googledrive::drive_download(file = filename, path = zipfile, overwrite = TRUE)
+  googledrive::drive_download(file = id, path = zipfile, overwrite = TRUE)
 
   # Close DB, remove live files
   con <- get_con()
