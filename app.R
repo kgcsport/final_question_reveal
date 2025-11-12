@@ -1597,7 +1597,7 @@ server <- function(input, output, session) {
 
   observeEvent(input$restore_from_gs, {
     req(is_admin())
-    ss_id <- SHEET_ID
+    ss_id <- Sys.getenv("FINALQ_SHEET_ID", "")
 
     showNotification("Restoring…", type="message", duration = 2)
     ok <- FALSE
