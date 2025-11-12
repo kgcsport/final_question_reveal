@@ -516,13 +516,9 @@ init_gs4 <- function() {
   if (length(tabs) == 0) {
     stop("No tabs found in the sheet. Please check the sheet ID and permissions.")
   }
-  ok <- tryCatch(restore_db_from_drive(), error = function(e) { FALSE })
-  if (isTRUE(ok)) {
-    logf("Restore: from drive complete")
-  } else {
-    logf("Restore: from drive failed as no database file found. Confirm this is a fresh install.")
-  }
-  logf("Restore: from drive complete")
+  ok <- tryCatch(restore_db_from_drive(), error = function(e) { logf("Restore: from drive failed: %s", e$message); FALSE })
+  if (isTRUE(ok)) logf("Restore: from drive complete")
+
 }
 init_gs4()
 
