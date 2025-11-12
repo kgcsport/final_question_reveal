@@ -86,39 +86,33 @@ title_from_html <- function(x) {
 # SQLite connection + schema (HARDENED)
 # -------------------------
 
+# replace app_data_dir() definition with this:
 app_data_dir <- local({
+  dir <- NULL
   function() {
-    root <- Sys.getenv("CONNECT_CONTENT_DIR", unset = getwd())
+    if (!is.null(dir)) return(dir)
+    root <- Sys.getenv("CONNECT_CONTENT_DIR")
+    if (!nzchar(root)) stop("CONNECT_CONTENT_DIR not set; configure Posit Connect app data.")
     d <- file.path(root, "data")
-    if (!dir.exists(d)) {
-      ok <- try(dir.create(d, recursive = TRUE, showWarnings = FALSE), silent = TRUE)
-      if (!dir.exists(d)) {
-        # fallback
-        d <- file.path(tempdir(), "data")
-        dir.create(d, recursive = TRUE, showWarnings = FALSE)
-      }
+    if (!dir.exists(d)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+    if (!dir.exists(d)) stop(sprintf("Data directory not writable: %s", d))
+    # final write test
+    tf <- file.path(d, ".writetest"); on.exit(unlink(tf, force=TRUE), add=TRUE)
+    if (!isTRUE(try(file.create(tf), silent = TRUE))) {
+      stop(sprintf("Data directory not writable: %s", d))
     }
-    normalizePath(d, winslash = "/", mustWork = TRUE)
+    dir <<- normalizePath(d, winslash = "/", mustWork = TRUE)
+    dir
   }
 })
+DATA_DIR <- app_data_dir()
+DB_PATH  <- file.path(DATA_DIR, "appdata.sqlite")
+logf(sprintf("DB PATH: %s", DB_PATH))
 
-data_dir <- app_data_dir()
-ok_dir   <- dir.exists(data_dir)
-ok_write <- tryCatch({
-  tf <- file.path(data_dir, ".writetest"); on.exit(unlink(tf, force=TRUE), add=TRUE)
-  file.create(tf)
-}, error = function(e) FALSE)
-
-if (!isTRUE(ok_dir && ok_write)) {
-  stop(sprintf("Data directory not writable: %s", data_dir))
-}
-db_path <- file.path(data_dir, "appdata.sqlite")
-logf(sprintf("DB PATH: %s", db_path))
-
-# Immediately after: logf(sprintf("DB PATH: %s", db_path))
-dir_ok  <- dir.exists(dirname(db_path))
-write_ok <- try(file.create(file.path(dirname(db_path), ".writetest"), showWarnings = FALSE), silent = TRUE)
-unlink(file.path(dirname(db_path), ".writetest"), force = TRUE)
+# Immediately after: logf(sprintf("DB PATH: %s", DB_PATH))
+dir_ok  <- dir.exists(dirname(DB_PATH))
+write_ok <- try(file.create(file.path(dirname(DB_PATH), ".writetest"), showWarnings = FALSE), silent = TRUE)
+unlink(file.path(dirname(DB_PATH), ".writetest"), force = TRUE)
 
 logf(sprintf("DB dir exists: %s; write test: %s",
              dir_ok, if (identical(write_ok, TRUE)) "OK" else "FAIL"))
@@ -127,7 +121,7 @@ logf(sprintf("DB dir exists: %s; write test: %s",
 new_pool <- function() {
   pool::dbPool(
     drv = RSQLite::SQLite(),
-    dbname = db_path,
+    dbname = DB_PATH,
     journal_mode = "WAL",         # many readers + few writers
     busy_timeout = 5000,          # wait up to 5s for locks
     synchronous = NULL            # <- suppress “couldn't set synchronous” attempts
@@ -139,13 +133,18 @@ db <- NULL
 
 get_con <- function() {
   if (inherits(db, "pool") && !pool::poolClosed(db)) return(db)
-  # logf("Creating DB pool...")
-  # Ensure the directory still exists (app could have restarted)
-  app_data_dir()
-  db <<- new_pool()
+  db <<- pool::dbPool(RSQLite::SQLite(), dbname = DB_PATH,
+                      minSize = 1, maxSize = 5,
+                      idleTimeout = 60, validationInterval = 10)
   db
 }
 
+db_query <- function(sql, params = NULL, con = NULL) {
+  conn <- if (is.null(con)) get_con() else con
+  ok <- tryCatch(DBI::dbGetQuery(conn, "SELECT 1")[[1]] == 1, error = function(e) FALSE)
+  if (!ok) stop("DB validation failed")
+  if (is.null(params)) DBI::dbGetQuery(conn, sql) else DBI::dbGetQuery(conn, sql, params = params)
+}
 # Default to global pool unless a connection/pool is explicitly passed
 db_exec <- function(sql, params = NULL, con = NULL) {
   conn <- if (is.null(con)) get_con() else con
@@ -170,13 +169,6 @@ q_user_round <- function(uid, r) db_query("SELECT COALESCE(pledge,0) AS p
                                            list(uid, as.integer(r)))
 
 logf("Setting up database connection...")
-db_path <- file.path(app_data_dir(), "appdata.sqlite")
-logf(sprintf("DB PATH: %s", db_path))
-observe({
-  n <- tryCatch(db_query("SELECT COUNT(*) AS n FROM pledges")$n[1], error=function(e) NA_integer_)
-  logf(sprintf("pledges rowcount now: %s", as.character(n)))
-})
-
 try({
   db_exec("PRAGMA journal_mode=WAL;")
   db_exec("PRAGMA synchronous=NORMAL;")
@@ -299,9 +291,9 @@ backup_db_to_drive <- function() {
   db <<- NULL
 
   # Include -wal/-shm if present (WAL mode)
-  files <- c(db_path,
-             paste0(db_path, "-wal"),
-             paste0(db_path, "-shm"))
+  files <- c(DB_PATH,
+             paste0(DB_PATH, "-wal"),
+             paste0(DB_PATH, "-shm"))
   files <- files[file.exists(files)]
 
   # Zip everything into a single upload (portable)
@@ -463,12 +455,12 @@ restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
   db <<- NULL
 
   # Clean existing files
-  for (f in c(db_path, paste0(db_path, "-wal"), paste0(db_path, "-shm"))) {
+  for (f in c(DB_PATH, paste0(DB_PATH, "-wal"), paste0(DB_PATH, "-shm"))) {
     if (file.exists(f)) try(unlink(f, force = TRUE), silent = TRUE)
   }
 
   # Unzip into data dir
-  utils::unzip(zipfile, exdir = dirname(db_path))
+  utils::unzip(zipfile, exdir = dirname(DB_PATH))
 
   # Re-open and ensure schema seeds exist (your app already does this on use)
   get_con()
@@ -714,6 +706,11 @@ server <- function(input, output, session) {
   outputOptions(output, "authed", suspendWhenHidden = FALSE)
 
   output$auth_gate <- renderUI({ if (!rv$authed) login_ui() else NULL })
+
+  observe({
+    n <- tryCatch(db_query("SELECT COUNT(*) AS n FROM pledges")$n[1], error=function(e) NA_integer_)
+    logf(sprintf("pledges rowcount now: %s", as.character(n)))
+  })
 
   # ---- Login
   observeEvent(input$login_btn, {
