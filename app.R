@@ -91,7 +91,7 @@ app_data_dir <- local({
   dir <- NULL
   function() {
     if (!is.null(dir)) return(dir)
-    root <- Sys.getenv("CONNECT_CONTENT_DIR")
+    root <- Sys.getenv("CONNECT_CONTENT_DIR", unset = getwd())
     if (!nzchar(root)) stop("CONNECT_CONTENT_DIR not set; configure Posit Connect app data.")
     d <- file.path(root, "data")
     if (!dir.exists(d)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
