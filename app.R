@@ -1084,7 +1084,7 @@ server <- function(input, output, session) {
       fluidRow(
         column(5,
           textInput("gs_restore_id", "Backup Sheet",
-          value = "FinalQuestion_Pledges_Backup",
+          value = "appdata_latest_backup.zip",
           placeholder = "Shown name (does not affect restore")
         ),
         shiny::tags$small("This is just a label. Restore uses the configured Google Sheet ID quietly."),
