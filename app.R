@@ -132,9 +132,7 @@ db <- NULL
 
 get_con <- function() {
   if (inherits(db, "pool") && !pool::poolClosed(db)) return(db)
-  db <<- pool::dbPool(RSQLite::SQLite(), dbname = DB_PATH,
-                      minSize = 1, maxSize = 5,
-                      idleTimeout = 60, validationInterval = 10)
+  db <<- new_pool()
   db
 }
 
@@ -522,14 +520,6 @@ logf("Initializing database...")
 init_db()
 logf("Database initialized.")
 
-
-logf("Setting up database connection...")
-try({
-  db_exec("PRAGMA journal_mode=WAL;")
-  db_exec("PRAGMA synchronous=NORMAL;")
-  db_exec("PRAGMA busy_timeout=5000;")
-}, silent = TRUE)
-
 # OK to omit entirely on Connect; if you keep it:
 reg.finalizer(.GlobalEnv, function(e) try(pool::poolClose(db), silent = TRUE), onexit = TRUE)
 # Convenience getters/setters with SAFE defaults
@@ -712,7 +702,7 @@ server <- function(input, output, session) {
   # ---- Debounced Backup Wrapper ----
   backup_trigger <- reactiveVal(NULL)
 
-  backup_trigger_debounced <- debounce(backup_trigger, 15000)  # 15 seconds quiet time
+  backup_trigger_debounced <- debounce(backup_trigger, 1000)  # 1 second quiet time
 
   observeEvent(backup_trigger_debounced(), {
     logf("Running debounced backup...")
@@ -982,8 +972,7 @@ server <- function(input, output, session) {
     my_pledge_tick(isolate(my_pledge_tick()) + 1L)
     touch_heartbeat()
 
-    # trigger backup after 15 seconds of no changes
-    backup_trigger(Sys.time())
+    tryCatch(backup_db_to_drive(), error = function(e) logf("Backup failed:", e$message))
 
     showNotification("Pledge saved.", type = "message")
   })
