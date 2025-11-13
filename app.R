@@ -1360,14 +1360,14 @@ server <- function(input, output, session) {
 
   observeEvent(input$open_round, ignoreInit = TRUE, {
     req(is_admin())
+    st <- current_state()
+    set_state(round_open = 1, scale_factor = NA, started_at = as.character(Sys.time()))
     tryCatch(
       backup_db_to_drive(),
       error = function(e) logf(paste("backup after open_round failed:", e$message))
     )
-    st <- current_state()
-    set_state(round_open = 1, scale_factor = NA, started_at = as.character(Sys.time()))
     showNotification(glue("Pledging is OPEN for round {st$round}. Carryover available: {st$carryover}."), type="message")
-    backup_db_to_drive(); bump_admin()
+    bump_admin()
   })
 
   observeEvent(input$close_round, ignoreInit = TRUE, {
@@ -1616,7 +1616,11 @@ server <- function(input, output, session) {
 
     touch_heartbeat()
     showNotification("Prior pledges uploaded and set.", type = "message")
-    backup_db_to_drive(); bump_admin(); bump_round()
+    bump_admin(); bump_round()
+    tryCatch(
+      backup_db_to_drive(),
+      error = function(e) logf(paste("backup after upload_pledges failed:", e$message))
+    )
   })
 
   observeEvent(input$restore_from_drive, {
