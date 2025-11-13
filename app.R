@@ -1360,6 +1360,10 @@ server <- function(input, output, session) {
 
   observeEvent(input$open_round, ignoreInit = TRUE, {
     req(is_admin())
+    tryCatch(
+      backup_db_to_drive(),
+      error = function(e) logf(paste("backup after open_round failed:", e$message))
+    )
     st <- current_state()
     set_state(round_open = 1, scale_factor = NA, started_at = as.character(Sys.time()))
     showNotification(glue("Pledging is OPEN for round {st$round}. Carryover available: {st$carryover}."), type="message")
@@ -1420,6 +1424,10 @@ server <- function(input, output, session) {
     st <- current_state()
     new_round <- st$round + 1L
     set_state(round = new_round, round_open = 0, scale_factor = NA, started_at = NA)
+    tryCatch(
+      backup_db_to_drive(),
+      error = function(e) logf(paste("backup after next_round failed:", e$message))
+    )
     updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[new_round]]))
     showNotification(glue("Moved to round {new_round}. Carryover available: {current_state()$carryover}."), type="message")
     bump_admin()
@@ -1430,6 +1438,10 @@ server <- function(input, output, session) {
     st <- current_state()
     new_round <- st$round - 1L
     set_state(round = new_round, round_open = 0, scale_factor = NA, started_at = NA)
+    tryCatch(
+      backup_db_to_drive(),
+      error = function(e) logf(paste("backup after previous_round failed:", e$message))
+    )
     updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[new_round]]))
     showNotification(glue("Moved to round {new_round}. Carryover available: {current_state()$carryover}."), type="message")
     bump_admin()
