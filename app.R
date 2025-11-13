@@ -464,7 +464,7 @@ restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
 
   # Re-open and ensure schema seeds exist (your app already does this on use)
   get_con()
-  logf("DB restore complete from Drive snapshot: %s", cand$name)
+  logf("DB restore complete from Drive snapshot: %s", filename)
 
   # Optionally, touch heartbeat so active sessions refresh
   try(touch_heartbeat(), silent = TRUE)
