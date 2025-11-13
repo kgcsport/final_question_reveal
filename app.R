@@ -1367,7 +1367,7 @@ server <- function(input, output, session) {
     st <- current_state()
     set_state(round_open = 1, scale_factor = NA, started_at = as.character(Sys.time()))
     showNotification(glue("Pledging is OPEN for round {st$round}. Carryover available: {st$carryover}."), type="message")
-    bump_admin()
+    backup_db_to_drive(); bump_admin()
   })
 
   observeEvent(input$close_round, ignoreInit = TRUE, {
