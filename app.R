@@ -439,15 +439,16 @@ restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
   try(DBI::dbExecute(con, "PRAGMA wal_checkpoint(FULL);"), silent = TRUE)
   try(pool::poolClose(con), silent = TRUE)
   db <<- NULL
-
+  
   # Clean existing files
+  logf("Cleaning existing files...")
   for (f in c(DB_PATH, paste0(DB_PATH, "-wal"), paste0(DB_PATH, "-shm"))) {
     if (file.exists(f)) try(unlink(f, force = TRUE), silent = TRUE)
   }
-
+  logf("Existing files cleaned.")
   # Unzip into data dir
   utils::unzip(zipfile, exdir = dirname(DB_PATH))
-
+  logf("Unzipped into data dir.")
   # Re-open and ensure schema seeds exist (your app already does this on use)
   get_con()
   logf("DB restore complete from Drive snapshot: %s", filename)
@@ -497,21 +498,21 @@ init_gs4 <- function() {
     stop("No tabs found in the sheet. Please check the sheet ID and permissions.")
   }
   # IMPORTANT: Only auto-restore if there is NO local DB yet
-  logf("Attempting restore from Drive...")
-  ok <- tryCatch(restore_db_from_drive(), error = function(e) FALSE )
-  if (isTRUE(ok)) {
-    logf("Restore from drive complete.")
+  if (!file.exists(DB_PATH)) {
+    logf("No local DB found; attempting restore from Drive...")
+    ok <- tryCatch(restore_db_from_drive(), error = function(e) {
+      logf("Restore from drive failed: %s", e$message)
+      FALSE
+    })
+    if (isTRUE(ok)) {
+      logf("Restore from drive complete (cold start).")
+    } else {
+      logf("Restore from drive unavailable; starting with fresh DB.")
+    }
   } else {
-    logf("Restore from drive failed; starting with fresh DB.")
+    logf(sprintf("Local DB already present at %s; skipping auto-restore.", DB_PATH))
   }
 }
-
-logf("Setting up database connection...")
-try({
-  db_exec("PRAGMA journal_mode=WAL;")
-  db_exec("PRAGMA synchronous=NORMAL;")
-  db_exec("PRAGMA busy_timeout=5000;")
-}, silent = TRUE)
 
 init_gs4()
 
@@ -520,6 +521,14 @@ logf(paste("gs4 auth user:", tryCatch(googlesheets4::gs4_user()$email, error=fun
 logf("Initializing database...")
 init_db()
 logf("Database initialized.")
+
+
+logf("Setting up database connection...")
+try({
+  db_exec("PRAGMA journal_mode=WAL;")
+  db_exec("PRAGMA synchronous=NORMAL;")
+  db_exec("PRAGMA busy_timeout=5000;")
+}, silent = TRUE)
 
 # OK to omit entirely on Connect; if you keep it:
 reg.finalizer(.GlobalEnv, function(e) try(pool::poolClose(db), silent = TRUE), onexit = TRUE)
@@ -690,6 +699,15 @@ ui <- fluidPage(
 # -------------------------
 logf("Starting server...")
 server <- function(input, output, session) {
+  session$onSessionEnded(function() {
+    try(pool::poolClose(db), silent = TRUE)
+  })
+
+  # observe({
+  #   invalidateLater(5000, session)
+  #   fd <- length(list.files("/proc/self/fd"))
+  #   logf(sprintf("Open FD count: %s", fd))
+  # })
 
   # ---- Debounced Backup Wrapper ----
   backup_trigger <- reactiveVal(NULL)
@@ -823,7 +841,7 @@ server <- function(input, output, session) {
     tags$hr(),
     h5("Your submissions"),
     DTOutput("my_submissions"),
-    DTOutput("my_history_table")
+    tableOutput("my_history_table")
   )
   output$student_ui <- renderUI({ req(authed()); student_ui })
 
@@ -992,24 +1010,18 @@ server <- function(input, output, session) {
     DT::datatable(df, options = list(pageLength = 5), rownames = FALSE)
   })
 
-  output$my_history_table <- DT::renderDT({
+  output$my_history_table <- renderTable({
     req(authed())
-    if (rv$my_submission_pulse == 0) {
-      return(DT::datatable(data.frame(), options = list(dom = 't'), rownames = FALSE))
-    }
+    if (rv$my_submission_pulse == 0) return(data.frame())
     df <- tryCatch(
       db_query(
         "SELECT round AS Round, pledge AS Pledge, charged AS Charged, submitted_at AS Submitted
-         FROM pledges WHERE user_id=? ORDER BY round ASC;",
+        FROM pledges WHERE user_id=? ORDER BY round ASC;",
         params = list(user_id())
       ),
       error = function(e) data.frame()
     )
-    if (!nrow(df)) {
-      return(DT::datatable(data.frame(), options = list(dom = 't'), rownames = FALSE))
-    }
-    DT::datatable(df, rownames = FALSE,
-                  options = list(pageLength = 10, searching = FALSE, lengthChange = FALSE, ordering = TRUE))
+    df
   })
 
   # -------------------------
@@ -1294,7 +1306,7 @@ server <- function(input, output, session) {
       fluidRow(
         column(8, plotOutput("wtp_hist", height = 320)),
         column(4,
-          tags$div(style="font-size: 1.1em; margin-top: 1em;", DTOutput("wtp_total")),
+          tags$div(style="font-size: 1.1em; margin-top: 1em;", tableOutput("wtp_total")),
           tags$div(style="margin-top: 0.5em;", textOutput("wtp_stats")),
           tags$hr()
         )
@@ -1311,16 +1323,17 @@ server <- function(input, output, session) {
     .compute_wtp(st, s)
   })
 
-  output$wtp_total <- DT::renderDT({
+  output$wtp_total <- renderTable({
     ws <- wtp_summary()
-    logf(sprintf("wtp_summary: pledged=%f, carryover=%f, effective_total=%f, cost=%f, units_now=%d, carryforward=%f", ws$pledged, ws$carryover, ws$effective_total, ws$cost, ws$units_now, ws$carryforward))
-    data <- data.frame(
+    logf(sprintf("wtp_summary: pledged=%f, carryover=%f, effective_total=%f, cost=%f, units_now=%d, carryforward=%f",
+                ws$pledged, ws$carryover, ws$effective_total, ws$cost, ws$units_now, ws$carryforward))
+    data.frame(
       Metric = c("This round pledged","Carryover","Effective total",
-                 sprintf("Carryforward (if over COST = %.2f)", ws$cost)),
-      Value  = sprintf("%.2f", c(ws$pledged, ws$carryover, ws$effective_total, ws$carryforward))
+                sprintf("Carryforward (if over COST = %.2f)", ws$cost)),
+      Value  = sprintf("%.2f", c(ws$pledged, ws$carryover, ws$effective_total, ws$carryforward)),
+      stringsAsFactors = FALSE
     )
-    datatable(data, rownames = FALSE, options = list(dom='t', paging=FALSE, ordering=FALSE), colnames=c("", ""))
-  })
+  }, striped = TRUE, bordered = FALSE, rownames = FALSE)
 
   round_df <- reactive({
     st <- current_state()
@@ -1657,10 +1670,10 @@ server <- function(input, output, session) {
     showNotification("Restoring…", type="message", duration = 2)
     ok <- FALSE
     msg <- NULL
-    try({
-      ok <- restore_db_from_drive()
-    }, silent = TRUE)
-
+    ok <- tryCatch(restore_db_from_drive(), error = function(e) {
+      logf("Restore from drive failed: %s", e$message)
+      FALSE
+    })
     if (isTRUE(ok)) {
       showNotification("Restore complete. State recomputed from sheet.", type="message")
       touch_heartbeat();  # wake all sessions
