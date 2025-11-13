@@ -136,20 +136,35 @@ get_con <- function() {
   db
 }
 
-db_query <- function(sql, params = NULL, con = NULL) {
-  conn <- if (is.null(con)) get_con() else con
-  ok <- tryCatch(DBI::dbGetQuery(conn, "SELECT 1")[[1]] == 1, error = function(e) FALSE)
-  if (!ok) stop("DB validation failed")
-  if (is.null(params)) DBI::dbGetQuery(conn, sql) else DBI::dbGetQuery(conn, sql, params = params)
-}
 # Default to global pool unless a connection/pool is explicitly passed
 db_exec <- function(sql, params = NULL, con = NULL) {
   conn <- if (is.null(con)) get_con() else con
   DBI::dbExecute(conn, sql, params = params)
 }
+
 db_query <- function(sql, params = NULL, con = NULL) {
-  conn <- if (is.null(con)) get_con() else con
-  DBI::dbGetQuery(conn, sql, params = params)
+  conn <- if (is.null(con)) {
+    tryCatch(get_con(), # try to get a connection, if failed, return NULL
+      error = function(e) {
+        logf(sprintf("db_query: get_con failed: %s", e$message))
+        return(NULL)
+      }
+    )
+  } else {
+    con
+  }
+  if (is.null(conn)) {
+    # Hard failure: return empty data frame
+    return(data.frame())
+  }
+  out <- tryCatch(
+    DBI::dbGetQuery(conn, sql, params = params),
+    error = function(e) {
+      logf(sprintf("db_query failed: %s | SQL: %s", e$message, sql))
+      data.frame()
+    }
+  )
+  out
 }
 
 touch_heartbeat <- function() db_exec("UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
@@ -689,9 +704,9 @@ ui <- fluidPage(
 # -------------------------
 logf("Starting server...")
 server <- function(input, output, session) {
-  session$onSessionEnded(function() {
-    try(pool::poolClose(db), silent = TRUE)
-  })
+  # session$onSessionEnded(function() {
+  #   try(pool::poolClose(db), silent = TRUE)
+  # })
 
   # observe({
   #   invalidateLater(5000, session)
@@ -699,7 +714,7 @@ server <- function(input, output, session) {
   #   logf(sprintf("Open FD count: %s", fd))
   # })
 
-  # ---- Debounced Backup Wrapper ----
+  # ---- Debounced Backup Wrapper1 ----
   backup_trigger <- reactiveVal(NULL)
 
   backup_trigger_debounced <- debounce(backup_trigger, 1000)  # 1 second quiet time
@@ -972,7 +987,8 @@ server <- function(input, output, session) {
     my_pledge_tick(isolate(my_pledge_tick()) + 1L)
     touch_heartbeat()
 
-    tryCatch(backup_db_to_drive(), error = function(e) logf("Backup failed:", e$message))
+    # tryCatch(backup_db_to_drive(), error = function(e) logf("Backup failed:", e$message))
+    backup_trigger(Sys.time())
 
     showNotification("Pledge saved.", type = "message")
   })
@@ -1338,19 +1354,36 @@ server <- function(input, output, session) {
   })
 
   output$wtp_hist <- renderPlot({
-    # df <- round_df() 
     st <- current_state()
-    df <- db_query("SELECT pledge, round FROM pledges WHERE round <= ?;", params = list(st$round))
+    df <- db_query("SELECT pledge, round FROM pledges WHERE round <= ?;",
+                  params = list(st$round))
     s <- current_settings()
-    
-    ggplot2::ggplot(df, ggplot2::aes(x = pledge,fill=as.factor(round))) +
-      ggplot2::geom_histogram(binwidth = s$slider_step, boundary = 0, closed = "left",position='dodge') +
-      ggplot2::scale_x_continuous(limits = c(0, s$max_per_student),
-                                  breaks = seq(0, s$max_per_student, by = s$slider_step)) +
-      scale_fill_brewer(palette="Set2") +
-      ggplot2::labs(x = "Pledge (WTP)", y = "Count", fill="Round") +
+
+    # If db_query failed, it will return data.frame(); handle that
+    if (!nrow(df)) {
+      logf(sprintf("wtp_hist: no pledges found for rounds <= %s", st$round))
+      return(NULL)
+    }
+
+    # Guard against bad slider settings
+    if (is.null(s$slider_step) || !is.finite(s$slider_step) || s$slider_step <= 0 ||
+        is.null(s$max_per_student) || !is.finite(s$max_per_student) || s$max_per_student <= 0) {
+      logf("wtp_hist: invalid settings (slider_step=%s, max_per_student=%s)",
+          as.character(s$slider_step), as.character(s$max_per_student))
+      return(NULL)
+    }
+
+    ggplot2::ggplot(df, ggplot2::aes(x = pledge, fill = as.factor(round))) +
+      ggplot2::geom_histogram(binwidth = s$slider_step, boundary = 0,
+                              closed = "left", position = "dodge") +
+      ggplot2::scale_x_continuous(
+        limits = c(0, s$max_per_student),
+        breaks = seq(0, s$max_per_student, by = s$slider_step)
+      ) +
+      scale_fill_brewer(palette = "Set2") +
+      ggplot2::labs(x = "Pledge (WTP)", y = "Count", fill = "Round") +
       ggplot2::theme_bw() +
-      ggplot2::theme(legend.position = if(st$round>1) "bottom" else "none")
+      ggplot2::theme(legend.position = if (st$round > 1) "bottom" else "none")
   })
 
   output$projector_question <- renderUI({
