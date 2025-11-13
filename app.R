@@ -510,9 +510,25 @@ init_gs4 <- function() {
   if (length(tabs) == 0) {
     stop("No tabs found in the sheet. Please check the sheet ID and permissions.")
   }
-  ok <- tryCatch(restore_db_from_drive(), error = function(e) { logf("Restore: from drive failed: %s", e$message); FALSE })
-  if (isTRUE(ok)) logf("Restore: from drive complete")
-
+  # IMPORTANT: Only auto-restore if there is NO local DB yet
+  if (!file.exists(DB_PATH)) {
+    logf("No local DB found at startup; attempting restore from Drive...")
+    ok <- tryCatch(
+      restore_db_from_drive(),
+      error = function(e) { 
+        logf("Restore: from drive failed: %s", e$message)
+        FALSE
+      }
+    )
+    if (isTRUE(ok)) {
+      logf("Restore: from drive complete (cold start).")
+    } else {
+      logf("Restore: from drive skipped or failed; starting with fresh DB.")
+      # `init_db()` will have already created a minimal schema/state
+    }
+  } else {
+    logf(sprintf("Local DB already present at %s; skipping auto-restore.", DB_PATH))
+  }
 }
 init_gs4()
 
