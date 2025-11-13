@@ -1103,11 +1103,31 @@ server <- function(input, output, session) {
         column(4,
           tags$small("Restores pledges (+charges if present) and recomputes unlocked/carry.")
         )
-      )
-
+      ),
+      tags$hr(),
+      h5("Debug: DB state (for instructor only)"),
+      verbatimTextOutput("db_debug"),
+      tags$hr()
     )
   })
   output$admin_ui <- renderUI(admin_controls())
+
+  output$db_debug <- renderPrint({
+    req(is_admin())
+    list(
+      DB_PATH = DB_PATH,
+      game_state = tryCatch(q_state(), error = function(e) e),
+      pledges_by_round = tryCatch(
+        db_query("SELECT round,
+                          COUNT(*) AS n_pledges,
+                          ROUND(SUM(COALESCE(pledge,0)),2) AS total_pledge
+                  FROM pledges
+                  GROUP BY round
+                  ORDER BY round;"),
+        error = function(e) e
+      )
+    )
+  })
 
   observeEvent(input$apply_settings, {
     req(is_admin())
@@ -1363,8 +1383,7 @@ server <- function(input, output, session) {
     st <- current_state()
     set_state(round_open = 1, scale_factor = NA, started_at = as.character(Sys.time()))
     tryCatch(
-      backup_db_to_drive(),
-      error = function(e) logf(paste("backup after open_round failed:", e$message))
+      backup_db_to_drive(), error = function(e) logf(paste("backup after open_round failed:", e$message))
     )
     showNotification(glue("Pledging is OPEN for round {st$round}. Carryover available: {st$carryover}."), type="message")
     bump_admin()
