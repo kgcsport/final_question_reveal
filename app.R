@@ -3,7 +3,7 @@
 # ============================================================
 
 if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
-pacman::p_load(shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue,googledrive, googlesheets4)  # <-- add googledrive here
+pacman::p_load(shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue,googledrive, googlesheets4,config)  # <-- add googledrive here
 
 
 `%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(as.character(a))) a else b
@@ -13,8 +13,6 @@ logf <- function(...) cat(format(Sys.time()), "-", paste(..., collapse=" "), "\n
 
 options(shiny.sanitize.errors = FALSE)
 options(shiny.fullstacktrace = TRUE)
-
-logf("Get the database directory: ", config::get("DatabaseDir"))
 
 logf("getwd:", getwd())
 
