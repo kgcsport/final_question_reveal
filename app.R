@@ -168,17 +168,7 @@ q_user_round <- function(uid, r) db_query("SELECT COALESCE(pledge,0) AS p
                                            FROM pledges WHERE user_id=? AND round=?;",
                                            list(uid, as.integer(r)))
 
-logf("Setting up database connection...")
-try({
-  db_exec("PRAGMA journal_mode=WAL;")
-  db_exec("PRAGMA synchronous=NORMAL;")
-  db_exec("PRAGMA busy_timeout=5000;")
-}, silent = TRUE)
 
-# OK to omit entirely on Connect; if you keep it:
-reg.finalizer(.GlobalEnv, function(e) try(pool::poolClose(db), silent = TRUE), onexit = TRUE)
-
-logf("Initializing database...")
 init_db <- function() {
   logf("Creating users table...")
   db_exec("
@@ -256,9 +246,6 @@ init_db <- function() {
       params = list(CRED$user[i], CRED$name[i], as.integer(isTRUE(CRED$is_admin[i]))))
   })
 }
-init_db()
-
-logf("Database initialized.")
 
 drive_folder_id <- function() {
   Sys.getenv("PUB_ECON_FOLDER_ID", "17lAi7_K7h9aN1ZQf3n8pHYxCowGAdbKG")
@@ -513,27 +500,34 @@ init_gs4 <- function() {
   # IMPORTANT: Only auto-restore if there is NO local DB yet
   if (!file.exists(DB_PATH)) {
     logf("No local DB found at startup; attempting restore from Drive...")
-    ok <- tryCatch(
-      restore_db_from_drive(),
-      error = function(e) { 
-        logf("Restore: from drive failed: %s", e$message)
-        FALSE
-      }
-    )
+    ok <- tryCatch(restore_db_from_drive(), error = function(e) { logf(...); FALSE })
     if (isTRUE(ok)) {
       logf("Restore: from drive complete (cold start).")
     } else {
       logf("Restore: from drive skipped or failed; starting with fresh DB.")
-      # `init_db()` will have already created a minimal schema/state
     }
   } else {
     logf(sprintf("Local DB already present at %s; skipping auto-restore.", DB_PATH))
   }
 }
+
+logf("Setting up database connection...")
+try({
+  db_exec("PRAGMA journal_mode=WAL;")
+  db_exec("PRAGMA synchronous=NORMAL;")
+  db_exec("PRAGMA busy_timeout=5000;")
+}, silent = TRUE)
+
 init_gs4()
 
 logf(paste("gs4 auth user:", tryCatch(googlesheets4::gs4_user()$email, error=function(e) "unknown"))) 
 
+logf("Initializing database...")
+init_db()
+logf("Database initialized.")
+
+# OK to omit entirely on Connect; if you keep it:
+reg.finalizer(.GlobalEnv, function(e) try(pool::poolClose(db), silent = TRUE), onexit = TRUE)
 # Convenience getters/setters with SAFE defaults
 blank_settings <- function() tibble(
   id=1, cost=24, max_per_student=7.5, slider_step=0.5,
