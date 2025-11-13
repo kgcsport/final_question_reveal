@@ -14,6 +14,7 @@ logf <- function(...) cat(format(Sys.time()), "-", paste(..., collapse=" "), "\n
 options(shiny.sanitize.errors = FALSE)
 options(shiny.fullstacktrace = TRUE)
 
+logf("Get the database directory: ", config::get("DatabaseDir"))
 
 logf("getwd:", getwd())
 
@@ -696,6 +697,16 @@ ui <- fluidPage(
 logf("Starting server...")
 server <- function(input, output, session) {
 
+  # ---- Debounced Backup Wrapper ----
+  backup_trigger <- reactiveVal(NULL)
+
+  backup_trigger_debounced <- debounce(backup_trigger, 15000)  # 15 seconds quiet time
+
+  observeEvent(backup_trigger_debounced(), {
+    logf("Running debounced backup...")
+    tryCatch(backup_db_to_drive(), error = function(e) logf("Debounced backup failed:", e$message))
+  })
+
   rv <- reactiveValues(
     authed = FALSE,
     user = NULL,
@@ -948,6 +959,9 @@ server <- function(input, output, session) {
     my_pledge_tick(isolate(my_pledge_tick()) + 1L)
     touch_heartbeat()
 
+    # trigger backup after 15 seconds of no changes
+    backup_trigger(Sys.time())
+
     showNotification("Pledge saved.", type = "message")
   })
 
@@ -972,7 +986,6 @@ server <- function(input, output, session) {
 
     DT::datatable(df, options = list(pageLength = 5), rownames = FALSE)
   })
-
 
   output$my_history_table <- DT::renderDT({
     req(authed())
@@ -1142,6 +1155,7 @@ server <- function(input, output, session) {
 
     showNotification("Settings updated for all players.", type = "message")
     bump_admin()
+    backup_trigger(Sys.time())
   })
 
   output$admin_round_title <- renderText({
@@ -1253,6 +1267,7 @@ server <- function(input, output, session) {
 
     db_exec("UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
     bump_admin(); bump_round()
+    backup_trigger(Sys.time())
   }, ignoreInit = TRUE)
 
 
@@ -1437,10 +1452,7 @@ server <- function(input, output, session) {
     st <- current_state()
     new_round <- st$round + 1L
     set_state(round = new_round, round_open = 0, scale_factor = NA, started_at = NA)
-    tryCatch(
-      backup_db_to_drive(),
-      error = function(e) logf(paste("backup after next_round failed:", e$message))
-    )
+    backup_trigger(Sys.time())
     updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[new_round]]))
     showNotification(glue("Moved to round {new_round}. Carryover available: {current_state()$carryover}."), type="message")
     bump_admin()
@@ -1451,10 +1463,7 @@ server <- function(input, output, session) {
     st <- current_state()
     new_round <- st$round - 1L
     set_state(round = new_round, round_open = 0, scale_factor = NA, started_at = NA)
-    tryCatch(
-      backup_db_to_drive(),
-      error = function(e) logf(paste("backup after previous_round failed:", e$message))
-    )
+    backup_trigger(Sys.time())
     updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[new_round]]))
     showNotification(glue("Moved to round {new_round}. Carryover available: {current_state()$carryover}."), type="message")
     bump_admin()
@@ -1484,7 +1493,7 @@ server <- function(input, output, session) {
               started_at = NA, question_text = as.character(QUESTIONS[[1]]))
     updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[1]]))
     showNotification("All rounds and pledges reset (roster kept).", type="error")
-    backup_db_to_drive()
+    backup_trigger(Sys.time())
     bump_admin()
   })
 
@@ -1512,7 +1521,6 @@ server <- function(input, output, session) {
       easyClose = TRUE
     ))
 
-    backup_db_to_drive()
   })
 
   observeEvent(input$confirm_reset_current, {
@@ -1532,6 +1540,7 @@ server <- function(input, output, session) {
 
     touch_heartbeat()
     showNotification(sprintf("Round %d reset.", r), type = "message")
+    backup_trigger(Sys.time())
   })
 
 
