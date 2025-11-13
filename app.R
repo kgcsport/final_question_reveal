@@ -3,7 +3,7 @@
 # ============================================================
 
 if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
-pacman::p_load(shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue,googledrive, googlesheets4,config)  # <-- add googledrive here
+pacman::p_load(shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue,googledrive, googlesheets4)  # <-- add googledrive here
 
 
 `%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(as.character(a))) a else b
@@ -498,7 +498,7 @@ init_gs4 <- function() {
   }
   # IMPORTANT: Only auto-restore if there is NO local DB yet
   logf("Attempting restore from Drive...")
-  ok <- tryCatch(restore_db_from_drive(), error = function(e) { logf(...); FALSE })
+  ok <- tryCatch(restore_db_from_drive(), error = function(e) FALSE )
   if (isTRUE(ok)) {
     logf("Restore from drive complete.")
   } else {
@@ -810,7 +810,6 @@ server <- function(input, output, session) {
     h4(textOutput("round_title")),
     uiOutput("game_rules"),
     tags$hr(),
-    uiOutput("round_status"),
     tags$hr(),
     uiOutput("whoami"),
     tags$hr(),
@@ -819,6 +818,8 @@ server <- function(input, output, session) {
     tags$hr(),
     h5("Round progress"),
     uiOutput("progress_text"),
+    tags$hr(),
+    uiOutput("round_status"),
     tags$hr(),
     h5("Your submissions"),
     DTOutput("my_submissions"),
@@ -856,18 +857,28 @@ server <- function(input, output, session) {
 
   output$round_status <- renderUI({
     st <- current_state()
+    ui <- list()
+
+    # Always show unlocked questions (if any unlocked)
+    if (st$unlocked_units > 0) {
+      ui <- append(ui, list(render_unlocked_questions(st$unlocked_units)))
+    }
+
     if (is_open(st$round_open)) {
-      tagList(
+      ui <- append(ui, list(
         p(sprintf("Pledging is OPEN. Submit your pledge (0–%g).", current_settings()$max_per_student)),
         wellPanel(strong("This round's question is hidden until funded."),
                   p("Once the class total meets the cost, the question will appear here."))
-      )
-    } else if (st$unlocked_units > 0) {
-      render_unlocked_questions(st$unlocked_units)
+      ))
     } else {
-      p("Pledging is CLOSED. Waiting for instructor to open the next round.")
+      ui <- append(ui, list(
+        p("Pledging is CLOSED. Waiting for instructor to open the next round.")
+      ))
     }
+
+    tagList(ui)
   })
+
 
   output$progress_text <- renderUI({
     st <- current_state()
