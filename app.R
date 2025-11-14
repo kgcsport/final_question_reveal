@@ -717,7 +717,10 @@ server <- function(input, output, session) {
   observe({
     invalidateLater(5000, session)
     fd <- length(list.files("/proc/self/fd"))
-    logf(sprintf("Open FD count: %s, last file: %s", fd, tail(list.files("/proc/self/fd"), 1)))
+    files <- list.files(pattern = "*.txt", full.names = TRUE)
+    file_details <- file.info(files)
+    sorted_files_asc <- files[order(file_details$mtime)]
+    logf(sprintf("Open FD count: %s, oldest file: %s, newest file: %s", fd, sorted_files_asc[1], sorted_files_asc[length(sorted_files_asc)]))
   })
 
   logf("open connections: %s", length(showConnections(all = TRUE)))
