@@ -716,14 +716,16 @@ server <- function(input, output, session) {
 
   observe({
     invalidateLater(5000, session)
-    files <- list.files(path = "/proc/self/fd", full.names = TRUE)
-    fd <- length(files)
-    targets <- sapply(files, function(f) tryCatch(readlink(f), error = function(e) NA))
-    targets <- targets[!is.na(targets)]
-    file_details <- file.info(files)
-    sorted_files_asc <- targets[order(file_details$mtime)]
-    logf(sprintf("Open FD count: %s, oldest file: %s, newest file: %s", fd, head(sorted_files_asc, 1), tail(sorted_files_asc, 1)))
+    files <- list.files("/proc/self/fd", full.names = TRUE)
+    targets <- sapply(files, function(f) {
+      tryCatch(readlink(f), error = function(e) NA_character_)
+    })
+    df <- data.frame(fd = basename(files), target = targets, stringsAsFactors = FALSE)
+
+    # Just log the last 10 descriptors
+    logf("FD snapshot:\n%s and has %s open files", paste(utils::capture.output(tail(df, 10)), collapse = "\n"), nrow(df))
   })
+
 
   logf("open connections: %s", length(showConnections(all = TRUE)))
 
