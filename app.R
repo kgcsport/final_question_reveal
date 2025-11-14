@@ -717,9 +717,9 @@ server <- function(input, output, session) {
   observe({
     invalidateLater(5000, session)
     files <- list.files(path = "/proc/self/fd", full.names = TRUE)
-    fd <- fd - length(files)
+    fd <- length(files)
     file_details <- file.info(files)
-    sorted_files_asc <- files[order(file_details$mtime)]
+    sorted_files_asc <- files[or1er(file_details$mtime)]
     logf(sprintf("Open FD count: %s, oldest file: %s, newest file: %s", fd, sorted_files_asc[1], sorted_files_asc[length(sorted_files_asc)]))
   })
 
