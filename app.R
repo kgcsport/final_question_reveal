@@ -466,7 +466,13 @@ restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
   get_con()
   logf("DB restore complete from Drive snapshot: %s", filename)
 
-  # Optionally, touch heartbeat so active sessions refresh
+  # NEW: sanity check rowcount
+  n <- tryCatch(
+    db_query("SELECT COUNT(*) AS n FROM pledges")$n[1],
+    error = function(e) NA_integer_
+  )
+  logf(sprintf("After restore, pledges rowcount: %s", as.character(n)))
+
   try(touch_heartbeat(), silent = TRUE)
 
   invisible(TRUE)
@@ -708,11 +714,11 @@ server <- function(input, output, session) {
   #   try(pool::poolClose(db), silent = TRUE)
   # })
 
-  # observe({
-  #   invalidateLater(5000, session)
-  #   fd <- length(list.files("/proc/self/fd"))
-  #   logf(sprintf("Open FD count: %s", fd))
-  # })
+  observe({
+    invalidateLater(5000, session)
+    fd <- length(list.files("/proc/self/fd"))
+    logf(sprintf("Open FD count: %s", fd))
+  })
 
   logf("open connections: %s", length(showConnections(all = TRUE)))
 
