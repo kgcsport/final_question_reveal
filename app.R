@@ -717,7 +717,7 @@ server <- function(input, output, session) {
   observe({
     invalidateLater(5000, session)
     fd <- length(list.files("/proc/self/fd"))
-    logf(sprintf("Open FD count: %s", fd))
+    logf(sprintf("Open FD count: %s, last file: %s", fd, tail(list.files("/proc/self/fd"), 1)))
   })
 
   logf("open connections: %s", length(showConnections(all = TRUE)))
