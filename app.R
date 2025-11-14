@@ -714,6 +714,8 @@ server <- function(input, output, session) {
   #   logf(sprintf("Open FD count: %s", fd))
   # })
 
+  logf("open connections: %s", length(showConnections(all = TRUE)))
+
   # ---- Debounced Backup Wrapper1 ----
   backup_trigger <- reactiveVal(NULL)
 
