@@ -630,6 +630,9 @@ render_unlocked_questions <- function(units) {
 # -------------------------
 # UI (same)
 # -------------------------
+# -------------------------
+# UI (same)
+# -------------------------
 login_ui <- function(msg = NULL) {
   fluidPage(
     titlePanel("Public Econ — Login"),
@@ -647,6 +650,16 @@ admin_pledges_upload_ui <- wellPanel(
   uiOutput("upload_pledges_status")
 )
 
+ui <- fluidPage(
+  uiOutput("auth_gate"),
+  conditionalPanel("output.authed",
+    tabsetPanel(
+      tabPanel("Student View", uiOutput("student_ui")),
+      tabPanel("Projector",    uiOutput("projector_ui")),
+      tabPanel("Admin View",   uiOutput("admin_ui"))
+    )
+  )
+)
 # -------------------------
 # Server
 # -------------------------
