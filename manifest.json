@@ -119,7 +119,7 @@
     },
     "RSQLite": {
       "Source": "CRAN",
-      "Repository": "https://cran.case.edu",
+      "Repository": "https://cloud.r-project.org",
       "description": {
         "Package": "RSQLite",
         "Title": "SQLite Interface for R",
@@ -181,7 +181,7 @@
     },
     "S7": {
       "Source": "CRAN",
-      "Repository": "https://cran.case.edu",
+      "Repository": "https://cloud.r-project.org",
       "description": {
         "Package": "S7",
         "Title": "An Object Oriented System Meant to Become a Successor to S3 and\nS4",
@@ -1968,7 +1968,7 @@
     },
     "otel": {
       "Source": "CRAN",
-      "Repository": "https://cran.case.edu",
+      "Repository": "https://cloud.r-project.org",
       "description": {
         "Package": "otel",
         "Title": "OpenTelemetry R API",
@@ -2079,7 +2079,7 @@
     },
     "plogr": {
       "Source": "CRAN",
-      "Repository": "https://cran.case.edu",
+      "Repository": "https://cloud.r-project.org",
       "description": {
         "Package": "plogr",
         "Title": "The 'plog' C++ Logging Library",
@@ -2105,7 +2105,7 @@
     },
     "pool": {
       "Source": "CRAN",
-      "Repository": "https://cran.case.edu",
+      "Repository": "https://cloud.r-project.org",
       "description": {
         "Type": "Package",
         "Package": "pool",
@@ -3458,20 +3458,14 @@
     }
   },
   "files": {
+    ".Rbuildignore": {
+      "checksum": "17f847933966777e7397760158d3dc05"
+    },
     "app.R": {
-      "checksum": "df9385422457262013cfe5d0c6bf4959"
+      "checksum": "90f25798be003294336cfd589a6bdee8"
     },
     "app.txt": {
-      "checksum": "df9385422457262013cfe5d0c6bf4959"
-    },
-    "appdata.sqlite": {
-      "checksum": "2b844bee03104026482162263ca87d13"
-    },
-    "appdata.sqlite-shm": {
-      "checksum": "851e9408bf55a46dd98a4ab80f584411"
-    },
-    "appdata.sqlite-wal": {
-      "checksum": "85b34fae4d159760d685ee77579aada5"
+      "checksum": "af543483dcde1a5c80fb51a4395185c4"
     },
     "bcrypt.R": {
       "checksum": "93b2531808a8adec8a59e75a1aabbe77"
@@ -3479,11 +3473,26 @@
     "credentials.csv": {
       "checksum": "5e9cf8da95721a65d274688ffb909787"
     },
+    "data/appdata.sqlite": {
+      "checksum": "d655f18affbf047b2cd9b92af72af2e9"
+    },
+    "data/appdata.sqlite-shm": {
+      "checksum": "b7c14ec6110fa820ca6b65f5aec85911"
+    },
+    "data/appdata.sqlite-wal": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+    },
+    "DESCRIPTION": {
+      "checksum": "8bd46078bae5d87ce6a2cb88db7745a5"
+    },
+    "google_application_credentials.json": {
+      "checksum": "c22971d85e2f315147b7ace763df3e20"
+    },
     "LICENSE": {
       "checksum": "1bf2b1a528109be1ef51dcd4abaaeef4"
     },
     "pledges.csv": {
-      "checksum": "2da2627797886416315af6870597b348"
+      "checksum": "480ec6103b0e528ae9869048b5b30364"
     },
     "README.md": {
       "checksum": "512b3daadbbc967022b0034138b6a134"

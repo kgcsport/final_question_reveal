@@ -1,7 +1,3 @@
-# ============================================================
-# Public Econ "Final Question Game" — SQLite-persistent (hardened)
-# ============================================================
-
 if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue,googledrive, googlesheets4)  # <-- add googledrive here
 
@@ -116,55 +112,23 @@ unlink(file.path(dirname(DB_PATH), ".writetest"), force = TRUE)
 logf(sprintf("DB dir exists: %s; write test: %s",
              dir_ok, if (identical(write_ok, TRUE)) "OK" else "FAIL"))
 
-# --- DB helpers (DRY all DBI:: calls) ---
-new_pool <- function() {
-  pool::dbPool(
-    drv = RSQLite::SQLite(),
-    dbname = DB_PATH,
-    journal_mode = "WAL",         # many readers + few writers
-    busy_timeout = 5000,          # wait up to 5s for locks
-    synchronous = NULL            # <- suppress “couldn't set synchronous” attempts
-    # cache_size = 100000         # optional: ~100MB page cache
-  )
-}
-
-db <- NULL
+conn <- NULL
 
 get_con <- function() {
-  if (inherits(db, "pool") && !pool::poolClosed(db)) return(db)
-  db <<- new_pool()
-  db
+  if (is.null(conn) || !DBI::dbIsValid(conn)) {
+    conn <<- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+  }
+  conn
 }
 
-# Default to global pool unless a connection/pool is explicitly passed
 db_exec <- function(sql, params = NULL, con = NULL) {
-  conn <- if (is.null(con)) get_con() else con
-  DBI::dbExecute(conn, sql, params = params)
+  con <- if (is.null(con)) get_con() else con
+  DBI::dbExecute(con, sql, params = params)
 }
 
 db_query <- function(sql, params = NULL, con = NULL) {
-  conn <- if (is.null(con)) {
-    tryCatch(get_con(), # try to get a connection, if failed, return NULL
-      error = function(e) {
-        logf(sprintf("db_query: get_con failed: %s", e$message))
-        return(NULL)
-      }
-    )
-  } else {
-    con
-  }
-  if (is.null(conn)) {
-    # Hard failure: return empty data frame
-    return(data.frame())
-  }
-  out <- tryCatch(
-    DBI::dbGetQuery(conn, sql, params = params),
-    error = function(e) {
-      logf(sprintf("db_query failed: %s | SQL: %s", e$message, sql))
-      data.frame()
-    }
-  )
-  out
+  con <- if (is.null(con)) get_con() else con
+  DBI::dbGetQuery(con, sql, params = params)
 }
 
 touch_heartbeat <- function() db_exec("UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
@@ -278,27 +242,20 @@ overwrite_ws <- function(ss, sheet_name, df) {
 
 backup_db_to_drive <- function() {
   folder_id <- drive_folder_id()
-  # Sanity check access to folder
   googledrive::drive_get(googledrive::as_id(folder_id))
 
-  # Make a safe, closed snapshot of the DB file
   con <- get_con()
   try(DBI::dbExecute(con, "PRAGMA wal_checkpoint(FULL);"), silent = TRUE)
+  # do NOT dbDisconnect() here; keep conn open
 
-  # Close the pool so the file isn't locked (recreated lazily on next get_con())
-  try(pool::poolClose(con), silent = TRUE)
-  db <<- NULL
-
-  # Include -wal/-shm if present (WAL mode)
   files <- c(DB_PATH,
              paste0(DB_PATH, "-wal"),
              paste0(DB_PATH, "-shm"))
   files <- files[file.exists(files)]
 
-  # Zip everything into a single upload (portable)
   zipfile <- file.path(tempdir(), sprintf("appdata_%s.zip",
                      format(Sys.time(), "%Y%m%d_%H%M%S")))
-  utils::zip(zipfile, files = files, flags = "-j")  # -j => no paths
+  utils::zip(zipfile, files = files, flags = "-j")
   # also make one called "latest" that is a copy of the dated one
   file.copy(zipfile, file.path(tempdir(), "appdata_latest_backup.zip"))
 
@@ -438,35 +395,33 @@ restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
   folder_id <- drive_folder_id()
   googledrive::drive_get(googledrive::as_id(folder_id))
 
-  # Pick the file: use provided name or the most recent appdata_*.zip
   id <- googledrive::drive_ls(googledrive::as_id(folder_id)) |>
     dplyr::filter(name == filename) |>
-    pull(id)
-  
-  # Download
+    dplyr::pull(id)
+
   zipfile <- file.path(tempdir(), filename)
   googledrive::drive_download(file = id, path = zipfile, overwrite = TRUE)
 
-  # Close DB, remove live files
-  con <- get_con()
-  try(DBI::dbExecute(con, "PRAGMA wal_checkpoint(FULL);"), silent = TRUE)
-  try(pool::poolClose(con), silent = TRUE)
-  db <<- NULL
-  
-  # Clean existing files
+  # --- Close any existing connection and forget it ---
+  if (!is.null(conn) && DBI::dbIsValid(conn)) {
+    try(DBI::dbDisconnect(conn), silent = TRUE)
+  }
+  conn <<- NULL  # important
+
+  # --- Clean existing DB files ---
   logf("Cleaning existing files...")
   for (f in c(DB_PATH, paste0(DB_PATH, "-wal"), paste0(DB_PATH, "-shm"))) {
     if (file.exists(f)) try(unlink(f, force = TRUE), silent = TRUE)
   }
   logf("Existing files cleaned.")
-  # Unzip into data dir
+
+  # --- Unzip new DB files ---
   utils::unzip(zipfile, exdir = dirname(DB_PATH))
   logf("Unzipped into data dir.")
-  # Re-open and ensure schema seeds exist (your app already does this on use)
-  get_con()
+
+  # DO NOT call get_con() here; let init_db() or db_query/db_exec lazily open it
   logf("DB restore complete from Drive snapshot: %s", filename)
 
-  # NEW: sanity check rowcount
   n <- tryCatch(
     db_query("SELECT COUNT(*) AS n FROM pledges")$n[1],
     error = function(e) NA_integer_
@@ -474,7 +429,6 @@ restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
   logf(sprintf("After restore, pledges rowcount: %s", as.character(n)))
 
   try(touch_heartbeat(), silent = TRUE)
-
   invisible(TRUE)
 }
 
@@ -542,7 +496,7 @@ init_db()
 logf("Database initialized.")
 
 # OK to omit entirely on Connect; if you keep it:
-reg.finalizer(.GlobalEnv, function(e) try(pool::poolClose(db), silent = TRUE), onexit = TRUE)
+reg.finalizer(.GlobalEnv, function(e) try(DBI::dbDisconnect(conn), silent = TRUE), onexit = TRUE)
 # Convenience getters/setters with SAFE defaults
 blank_settings <- function() tibble(
   id=1, cost=24, max_per_student=7.5, slider_step=0.5,
@@ -615,11 +569,10 @@ user_cumulative_charged <- function(user_id){
 }
 
 charge_round_bank_all <- function(rnd) {
-  pool::poolWithTransaction(get_con(), function(con){
-    DBI::dbExecute(con, "DELETE FROM charges WHERE round = ?;", params = list(as.integer(rnd)))
-    DBI::dbExecute(con, "INSERT INTO charges(user_id, round, amount)
-       SELECT user_id, round, pledge FROM pledges WHERE round = ?;", params = list(as.integer(rnd)))
-  })
+  con <- get_con()
+  DBI::dbExecute(con, "DELETE FROM charges WHERE round = ?;", params = list(as.integer(rnd)))
+  DBI::dbExecute(con, "INSERT INTO charges(user_id, round, amount)
+     SELECT user_id, round, pledge FROM pledges WHERE round = ?;", params = list(as.integer(rnd)))
 }
 
 .compute_wtp <- function(st, s) {
@@ -654,13 +607,13 @@ refund_carryover_proportionally <- function(carry){
   if (tot <= 0) return(invisible(FALSE))
   tc$refund <- carry * (tc$charged / tot)
   now <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-  pool::poolWithTransaction(get_con(), function(con){
-    purrr::pwalk(tc[, c("user_id","refund")], function(user_id, refund){
-      db_exec("INSERT INTO charges(user_id, round, amount, charged_at) VALUES(?, 9999, ?, ?);", params = list(user_id, -as.numeric(refund), now), con=con)
-    })
-    # set_state() writes outside the transaction; update via 'con' here:
-    db_exec("UPDATE game_state SET carryover=0, round_open=0, updated_at=CURRENT_TIMESTAMP WHERE id=1;", con=con)
+  con <- get_con()
+  purrr::pwalk(tc[, c("user_id","refund")], function(user_id, refund){
+    db_exec("INSERT INTO charges(user_id, round, amount, charged_at) VALUES(?, 9999, ?, ?);", params = list(user_id, -as.numeric(refund), now), con=con)
   })
+  # set_state() writes outside the transaction; update via 'con' here:
+  db_exec("UPDATE game_state SET carryover=0, round_open=0, updated_at=CURRENT_TIMESTAMP WHERE id=1;", con=con)
+  
   TRUE
 }
 
@@ -674,6 +627,9 @@ render_unlocked_questions <- function(units) {
   )
 }
 
+# -------------------------
+# UI (same)
+# -------------------------
 # -------------------------
 # UI (same)
 # -------------------------
@@ -704,16 +660,16 @@ ui <- fluidPage(
     )
   )
 )
-
 # -------------------------
 # Server
 # -------------------------
 logf("Starting server...")
 server <- function(input, output, session) {
   # session$onSessionEnded(function() {
-  #   try(pool::poolClose(db), silent = TRUE)
+  #   try(DBI::dbDisconnect(conn), silent = TRUE)
   # })
 
+  # FD + pledge monitor: logs every 5 seconds
   observe({
     invalidateLater(5000, session)
     files <- list.files("/proc/self/fd", full.names = TRUE)
@@ -723,7 +679,13 @@ server <- function(input, output, session) {
     df <- data.frame(fd = basename(files), target = targets, stringsAsFactors = FALSE)
 
     # Just log the last 10 descriptors
-    logf("FD snapshot:\n%s and has %s open files", paste(utils::capture.output(tail(df, 10)), collapse = "\n"), nrow(df))
+    logf("FD snapshot:\n%s and has %s open files", paste(utils::capture.output(tail(df, 1)), collapse = "\n"), nrow(df))
+  })
+
+  onStop(function() {
+    if (!is.null(conn) && DBI::dbIsValid(conn)) {
+      try(DBI::dbDisconnect(conn), silent = TRUE)
+    }
   })
 
 
@@ -985,15 +947,15 @@ server <- function(input, output, session) {
     snap <- round(raw / step) * step
     new_pledge <- max(0, min(cap, snap))
 
-    pool::poolWithTransaction(get_con(), function(con){
-      DBI::dbExecute(con,
-        "INSERT INTO pledges(user_id, name, round, pledge, submitted_at)
-        VALUES(?,?,?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id, round)
-        DO UPDATE SET pledge = excluded.pledge, submitted_at = CURRENT_TIMESTAMP;",
-        params = list(user_id(), dispname(), as.integer(st$round), as.numeric(new_pledge))
-      )
-    })
+    con <- get_con()
+    DBI::dbExecute(con,
+      "INSERT INTO pledges(user_id, name, round, pledge, submitted_at)
+      VALUES(?,?,?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(user_id, round)
+      DO UPDATE SET pledge = excluded.pledge, submitted_at = CURRENT_TIMESTAMP;",
+      params = list(user_id(), dispname(), as.integer(st$round), as.numeric(new_pledge))
+    )
+  # etc.
 
     # update this session’s slider value to reflect what actually got stored
     updateSliderInput(session, "pledge_amt", value = new_pledge)
@@ -1540,10 +1502,9 @@ server <- function(input, output, session) {
 
   observeEvent(input$confirm_reset_all, {
     removeModal()
-    pool::poolWithTransaction(get_con(), function(con){
-      DBI::dbExecute(con, "DELETE FROM pledges;")
-      DBI::dbExecute(con, "DELETE FROM charges;")
-    })
+    con <- get_con()
+    DBI::dbExecute(con, "DELETE FROM pledges;")
+    DBI::dbExecute(con, "DELETE FROM charges;")
     set_state(unlocked_units = 0L, carryover = 0, round = 1, round_open = 0, scale_factor = NA,
               started_at = NA, question_text = as.character(QUESTIONS[[1]]))
     updateTextAreaInput(session, "admin_question", value = title_from_html(QUESTIONS[[1]]))
@@ -1584,10 +1545,9 @@ server <- function(input, output, session) {
     s  <- current_settings()
     r  <- as.integer(st$round)
 
-    pool::poolWithTransaction(get_con(), function(con){
-      DBI::dbExecute(con, "DELETE FROM charges WHERE round = ?;", params = list(r))
-      DBI::dbExecute(con, "DELETE FROM pledges WHERE round = ?;", params = list(r))
-    })
+    con <- get_con()
+    DBI::dbExecute(con, "DELETE FROM charges WHERE round = ?;", params = list(r))
+    DBI::dbExecute(con, "DELETE FROM pledges WHERE round = ?;", params = list(r))
 
     # recompute the displayed state for *this* round
     ws <- .compute_wtp(current_state(), current_settings())
@@ -1638,7 +1598,7 @@ server <- function(input, output, session) {
     # Filter obviously bad rows early
     pledges_df <- subset(pledges_df, !is.na(user_id) & nzchar(user_id) & !is.na(round))
 
-    pool::poolWithTransaction(get_con(), function(con){
+    con <- get_con()
 
       # 1) Upsert users (character, character)
       purrr::pwalk(pledges_df[, c("user_id","name")], function(user_id, name){
@@ -1679,7 +1639,6 @@ server <- function(input, output, session) {
           }
         })
       }
-    })
 
     # Heartbeat + recompute state (reuse your helper)
     touch_heartbeat()
