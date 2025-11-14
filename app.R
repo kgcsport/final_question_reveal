@@ -224,7 +224,7 @@ init_db <- function() {
 }
 
 drive_folder_id <- function() {
-  Sys.getenv("PUB_ECON_FOLDER_ID", "17lAi7_K7h9aN1ZQf3n8pHYxCowGAdbKG")
+  Sys.getenv("PUB_ECON_FOLDER_ID", "")
 }
 
 # helper: hard overwrite a single worksheet (drop + recreate)
@@ -669,9 +669,11 @@ server <- function(input, output, session) {
   #   try(DBI::dbDisconnect(conn), silent = TRUE)
   # })
 
+  .last_backup_ts <- as.POSIXct(Sys.time() - 3600, tz = "UTC")  # 1 hour ago
+
   # FD + pledge monitor: logs every 5 seconds
   observe({
-    invalidateLater(5000, session)
+    invalidateLater(30000, session)
     files <- list.files("/proc/self/fd", full.names = TRUE)
     targets <- sapply(files, function(f) {
       tryCatch(readlink(f), error = function(e) NA_character_)
@@ -694,12 +696,25 @@ server <- function(input, output, session) {
   # ---- Debounced Backup Wrapper1 ----
   backup_trigger <- reactiveVal(NULL)
 
-  backup_trigger_debounced <- debounce(backup_trigger, 1000)  # 1 second quiet time
+  backup_trigger_debounced <- debounce(backup_trigger, 5000)  # 5 second quiet time
 
   observeEvent(backup_trigger_debounced(), {
+    now <- Sys.time()
+    if (difftime(now, .last_backup_ts, units = "secs") < 60) {
+      # Less than 60s since last backup → skip
+      logf("Skipping backup: last backup was too recent.")
+      return()
+    }
+
+    .last_backup_ts <<- now  # update the global timestamp
+
     logf("Running debounced backup...")
-    tryCatch(backup_db_to_drive(), error = function(e) logf("Debounced backup failed:", e$message))
+    tryCatch(
+      backup_db_to_drive(),
+      error = function(e) logf("Debounced backup failed:", e$message)
+    )
   })
+
 
   rv <- reactiveValues(
     authed = FALSE,
@@ -770,7 +785,7 @@ server <- function(input, output, session) {
   )
 
   current_state <- cached_poll(
-    2000, session,
+    5000, session,
     "SELECT updated_at FROM game_state WHERE id=1;",
     "SELECT * FROM game_state WHERE id=1;",
     .state_default
