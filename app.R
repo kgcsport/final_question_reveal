@@ -112,19 +112,23 @@ unlink(file.path(dirname(DB_PATH), ".writetest"), force = TRUE)
 logf(sprintf("DB dir exists: %s; write test: %s",
              dir_ok, if (identical(write_ok, TRUE)) "OK" else "FAIL"))
 
-# Single global connection, no pool
-conn <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+conn <- NULL
 
-get_con <- function() conn
+get_con <- function() {
+  if (is.null(conn) || !DBI::dbIsValid(conn)) {
+    conn <<- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+  }
+  conn
+}
 
 db_exec <- function(sql, params = NULL, con = NULL) {
-  conn <- if (is.null(con)) get_con() else con
-  DBI::dbExecute(conn, sql, params = params)
+  con <- if (is.null(con)) get_con() else con
+  DBI::dbExecute(con, sql, params = params)
 }
 
 db_query <- function(sql, params = NULL, con = NULL) {
-  conn <- if (is.null(con)) get_con() else con
-  DBI::dbGetQuery(conn, sql, params = params)
+  con <- if (is.null(con)) get_con() else con
+  DBI::dbGetQuery(con, sql, params = params)
 }
 
 touch_heartbeat <- function() db_exec("UPDATE game_state SET updated_at = CURRENT_TIMESTAMP WHERE id=1;")
@@ -238,27 +242,20 @@ overwrite_ws <- function(ss, sheet_name, df) {
 
 backup_db_to_drive <- function() {
   folder_id <- drive_folder_id()
-  # Sanity check access to folder
   googledrive::drive_get(googledrive::as_id(folder_id))
 
-  # Make a safe, closed snapshot of the DB file
   con <- get_con()
   try(DBI::dbExecute(con, "PRAGMA wal_checkpoint(FULL);"), silent = TRUE)
+  # do NOT dbDisconnect() here; keep conn open
 
-  # Close the pool so the file isn't locked (recreated lazily on next get_con())
-  try(DBI::dbDisconnect(con), silent = TRUE)
-  db <<- NULL
-
-  # Include -wal/-shm if present (WAL mode)
   files <- c(DB_PATH,
              paste0(DB_PATH, "-wal"),
              paste0(DB_PATH, "-shm"))
   files <- files[file.exists(files)]
 
-  # Zip everything into a single upload (portable)
   zipfile <- file.path(tempdir(), sprintf("appdata_%s.zip",
                      format(Sys.time(), "%Y%m%d_%H%M%S")))
-  utils::zip(zipfile, files = files, flags = "-j")  # -j => no paths
+  utils::zip(zipfile, files = files, flags = "-j")
   # also make one called "latest" that is a copy of the dated one
   file.copy(zipfile, file.path(tempdir(), "appdata_latest_backup.zip"))
 
@@ -398,35 +395,33 @@ restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
   folder_id <- drive_folder_id()
   googledrive::drive_get(googledrive::as_id(folder_id))
 
-  # Pick the file: use provided name or the most recent appdata_*.zip
   id <- googledrive::drive_ls(googledrive::as_id(folder_id)) |>
     dplyr::filter(name == filename) |>
-    pull(id)
-  
-  # Download
+    dplyr::pull(id)
+
   zipfile <- file.path(tempdir(), filename)
   googledrive::drive_download(file = id, path = zipfile, overwrite = TRUE)
 
-  # Close DB, remove live files
-  con <- get_con()
-  try(DBI::dbExecute(con, "PRAGMA wal_checkpoint(FULL);"), silent = TRUE)
-  try(DBI::dbDisconnect(con), silent = TRUE)
-  db <<- NULL
-  
-  # Clean existing files
+  # --- Close any existing connection and forget it ---
+  if (!is.null(conn) && DBI::dbIsValid(conn)) {
+    try(DBI::dbDisconnect(conn), silent = TRUE)
+  }
+  conn <<- NULL  # important
+
+  # --- Clean existing DB files ---
   logf("Cleaning existing files...")
   for (f in c(DB_PATH, paste0(DB_PATH, "-wal"), paste0(DB_PATH, "-shm"))) {
     if (file.exists(f)) try(unlink(f, force = TRUE), silent = TRUE)
   }
   logf("Existing files cleaned.")
-  # Unzip into data dir
+
+  # --- Unzip new DB files ---
   utils::unzip(zipfile, exdir = dirname(DB_PATH))
   logf("Unzipped into data dir.")
-  # Re-open and ensure schema seeds exist (your app already does this on use)
-  get_con()
+
+  # DO NOT call get_con() here; let init_db() or db_query/db_exec lazily open it
   logf("DB restore complete from Drive snapshot: %s", filename)
 
-  # NEW: sanity check rowcount
   n <- tryCatch(
     db_query("SELECT COUNT(*) AS n FROM pledges")$n[1],
     error = function(e) NA_integer_
@@ -434,7 +429,6 @@ restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
   logf(sprintf("After restore, pledges rowcount: %s", as.character(n)))
 
   try(touch_heartbeat(), silent = TRUE)
-
   invisible(TRUE)
 }
 
@@ -704,18 +698,22 @@ server <- function(input, output, session) {
   # FD + pledge monitor: logs every 5 seconds
   observe({
     invalidateLater(5000, session)
-
-    # Count FDs
     files <- list.files("/proc/self/fd", full.names = TRUE)
-    fd_count <- length(files)
+    targets <- sapply(files, function(f) {
+      tryCatch(readlink(f), error = function(e) NA_character_)
+    })
+    df <- data.frame(fd = basename(files), target = targets, stringsAsFactors = FALSE)
 
     # Just log the last 10 descriptors
-    logf("FD snapshot:\n%s and has %s open files", paste(utils::capture.output(tail(df, 10)), collapse = "\n"), nrow(df))
+    logf("FD snapshot:\n%s and has %s open files", paste(utils::capture.output(tail(df, 1)), collapse = "\n"), nrow(df))
   })
 
   onStop(function() {
-    try(DBI::dbDisconnect(conn), silent = TRUE)
+    if (!is.null(conn) && DBI::dbIsValid(conn)) {
+      try(DBI::dbDisconnect(conn), silent = TRUE)
+    }
   })
+
 
   logf("open connections: %s", length(showConnections(all = TRUE)))
 
