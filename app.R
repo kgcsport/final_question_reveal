@@ -647,27 +647,6 @@ admin_pledges_upload_ui <- wellPanel(
   uiOutput("upload_pledges_status")
 )
 
-ui <- fluidPage(
-  titlePanel("FD Leak MWE"),
-
-  sidebarLayout(
-    sidebarPanel(
-      numericInput("pledge", "Pledge amount", value = 0, min = 0),
-      actionButton("submit", "Submit pledge"),
-      tags$hr(),
-      verbatimTextOutput("status")
-    ),
-    mainPanel(
-      h4("Instructions"),
-      tags$ol(
-        tags$li("Deploy this app to the same Posit Connect environment."),
-        tags$li("Watch the server logs over time."),
-        tags$li("FD count should stay roughly flat if there's no leak.")
-      )
-    )
-  )
-)
-
 # -------------------------
 # Server
 # -------------------------
@@ -676,24 +655,6 @@ server <- function(input, output, session) {
   # session$onSessionEnded(function() {
   #   try(DBI::dbDisconnect(conn), silent = TRUE)
   # })
-
-  # Insert a row on submit
-  observeEvent(input$submit, {
-    amt <- suppressWarnings(as.numeric(input$pledge))
-    if (!is.finite(amt) || amt < 0) return()
-
-    dbExecute(
-      conn,
-      "INSERT INTO pledges(amount) VALUES (?);",
-      params = list(amt)
-    )
-  })
-
-  # Status shown in the UI
-  output$status <- renderPrint({
-    n <- dbGetQuery(conn, "SELECT COUNT(*) AS n FROM pledges;")$n[1]
-    cat("Pledges in DB:", n, "\n")
-  })
 
   # FD + pledge monitor: logs every 5 seconds
   observe({
