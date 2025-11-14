@@ -1665,7 +1665,6 @@ server <- function(input, output, session) {
           }
         })
       }
-    })
 
     # Heartbeat + recompute state (reuse your helper)
     touch_heartbeat()
@@ -1684,6 +1683,7 @@ server <- function(input, output, session) {
       backup_db_to_drive(),
       error = function(e) logf(paste("backup after upload_pledges failed:", e$message))
     )
+  })
 
   observeEvent(input$restore_from_drive, {
     req(is_admin())
