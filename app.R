@@ -1,95 +1,94 @@
-# app.R — MWE: persistent SQLite on Posit Connect Cloud
-
-# --- noisy (on purpose) so you can see what's happening in Logs ---
-options(shiny.sanitize.errors = FALSE, shiny.fullstacktrace = TRUE)
-logf <- function(...) { cat(format(Sys.time()), "-", paste(..., collapse=" "), "\n", file=stderr()); flush(stderr()) }
-
+# app.R - Minimal FD leak tester
 library(shiny)
 library(DBI)
 library(RSQLite)
-library(pool)
-library(tidyverse)
 
-# 1) Pick a persistent, writable dir.
-# On Posit Connect/Cloud, CONNECT_CONTENT_DIR points to per-app persistent storage.
-safe_data_dir <- function() {
-  d <- Sys.getenv("CONNECT_CONTENT_DIR", "")
-  if (nzchar(d)) {
-    d <- file.path(d, "data")
-  } else {
-    # Local dev fallback
-    d <- tools::R_user_dir("sqlite_mwe", which = "data")
-  }
-  if (!dir.exists(d)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
-  d
-}
+## ---- Global setup ----
 
-db_path <- file.path(safe_data_dir(), "appdata.sqlite")
-logf("DB path:", db_path)
+DB_DIR  <- "data"
+DB_PATH <- file.path(DB_DIR, "appdata.sqlite")
 
-# 2) Create a single process-scoped pool. Do NOT close it on each session end.
-db <- pool::dbPool(RSQLite::SQLite(), dbname = db_path)
-reg.finalizer(environment(), function(e) { try(pool::poolClose(db), silent = TRUE) }, onexit = TRUE)
+if (!dir.exists(DB_DIR)) dir.create(DB_DIR, recursive = TRUE, showWarnings = FALSE)
 
-# 3) Defensive pragmas (WAL can be finicky on some filesystems).
-#    TRUNCATE/DELETE journals are safer; busy_timeout avoids "database is locked".
-try(DBI::dbExecute(db, "PRAGMA journal_mode=TRUNCATE;"), silent = TRUE)
-try(DBI::dbExecute(db, "PRAGMA synchronous=NORMAL;"), silent = TRUE)
-try(DBI::dbExecute(db, "PRAGMA busy_timeout=5000;"), silent = TRUE)
+# Single global connection, no pool
+conn <- dbConnect(SQLite(), DB_PATH)
 
-# 4) Initialize schema (idempotent).
-DBI::dbExecute(db, "
-  CREATE TABLE IF NOT EXISTS events(
-    id   INTEGER PRIMARY KEY,
-    who  TEXT NOT NULL,
-    ts   TEXT NOT NULL
+# Make sure we close it when the R process exits
+onStop(function() {
+  try(dbDisconnect(conn), silent = TRUE)
+})
+
+# Create a tiny pledges table if it doesn't exist
+dbExecute(conn, "
+  CREATE TABLE IF NOT EXISTS pledges (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    amount       REAL,
+    submitted_at TEXT DEFAULT CURRENT_TIMESTAMP
   );
 ")
 
-# MWE app: add a row; show row count; show last 10 rows
+## ---- UI ----
+
 ui <- fluidPage(
-  tags$h3("SQLite on Posit Connect Cloud — MWE"),
-  verbatimTextOutput("info"),
-  textInput("who", "Your name", value = "tester"),
-  actionButton("add", "Add a row"),
-  actionButton("clear", "Clear all rows"),
-  tags$hr(),
-  strong("Row count:"),
-  textOutput("nrows"),
-  tags$h4("Last 10 rows"),
-  tableOutput("tbl")
+  titlePanel("FD Leak MWE"),
+
+  sidebarLayout(
+    sidebarPanel(
+      numericInput("pledge", "Pledge amount", value = 0, min = 0),
+      actionButton("submit", "Submit pledge"),
+      tags$hr(),
+      verbatimTextOutput("status")
+    ),
+    mainPanel(
+      h4("Instructions"),
+      tags$ol(
+        tags$li("Deploy this app to the same Posit Connect environment."),
+        tags$li("Watch the server logs over time."),
+        tags$li("FD count should stay roughly flat if there's no leak.")
+      )
+    )
+  )
 )
 
+## ---- Server ----
+
 server <- function(input, output, session) {
-  logf("SESSION start", session$token)
 
-  output$info <- renderText({
-    paste0("DB path: ", db_path, "\nFile exists: ", file.exists(db_path))
+  # Insert a row on submit
+  observeEvent(input$submit, {
+    amt <- suppressWarnings(as.numeric(input$pledge))
+    if (!is.finite(amt) || amt < 0) return()
+
+    dbExecute(
+      conn,
+      "INSERT INTO pledges(amount) VALUES (?);",
+      params = list(amt)
+    )
   })
 
-  observeEvent(input$add, {
-    nm <- if (nzchar(input$who)) input$who else "anon"
-    DBI::dbExecute(db, "INSERT INTO events(who, ts) VALUES (?, datetime('now'))", params = list(nm))
-    logf("Inserted row for", nm)
+  # Status shown in the UI
+  output$status <- renderPrint({
+    n <- dbGetQuery(conn, "SELECT COUNT(*) AS n FROM pledges;")$n[1]
+    cat("Pledges in DB:", n, "\n")
   })
 
-  observeEvent(input$clear, {
-    DBI::dbExecute(db, "DELETE FROM events")
-    logf("Cleared all rows")
+  # FD + pledge monitor: logs every 5 seconds
+  observe({
+    invalidateLater(5000, session)
+
+    # Count FDs
+    files <- list.files("/proc/self/fd", full.names = TRUE)
+    fd_count <- length(files)
+
+    # Count pledges
+    n <- tryCatch(
+      dbGetQuery(conn, "SELECT COUNT(*) AS n FROM pledges;")$n[1],
+      error = function(e) NA_integer_
+    )
+
+    # Log to server output
+    message(sprintf("MWE: Open FD count = %s, pledges = %s", fd_count, n))
   })
-
-  output$nrows <- renderText({
-    # re-run reactively when add/clear pressed
-    input$add; input$clear
-    as.character(DBI::dbGetQuery(db, "SELECT COUNT(*) AS n FROM events")$n)
-  })
-
-  output$tbl <- renderTable({
-    input$add; input$clear
-    DBI::dbGetQuery(db, "SELECT * FROM events ORDER BY id DESC LIMIT 10")
-  }, striped = TRUE, bordered = TRUE)
-
-  session$onSessionEnded(function() logf("SESSION stop", session$token))
 }
 
 shinyApp(ui, server)
