@@ -1,48 +1,116 @@
-# app.R - Minimal FD leak tester
-library(shiny)
-library(DBI)
-library(RSQLite)
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue,googledrive, googlesheets4)  # <-- add googledrive here
 
-## ---- Global setup ----
 
-DB_DIR  <- "data"
-DB_PATH <- file.path(DB_DIR, "appdata.sqlite")
+`%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(as.character(a))) a else b
 
-if (!dir.exists(DB_DIR)) dir.create(DB_DIR, recursive = TRUE, showWarnings = FALSE)
+# Log helper: writes to stderr (shows in Connect logs)
+logf <- function(...) cat(format(Sys.time()), "-", paste(..., collapse=" "), "\n", file=stderr())
 
-# Single global connection, no pool
-conn <- dbConnect(SQLite(), DB_PATH)
+options(shiny.sanitize.errors = FALSE)
+options(shiny.fullstacktrace = TRUE)
 
-# Make sure we close it when the R process exits
-onStop(function() {
-  try(dbDisconnect(conn), silent = TRUE)
+logf("getwd:", getwd())
+
+env_vars <- c("CRED_B64", "CRED_PATH", "CRED_CSV")
+vals <- Sys.getenv(env_vars, unset = "")
+logf("env present:", paste(env_vars, nzchar(vals), sep="=", collapse="; "))
+
+# For debugging only: log lengths, not contents
+logf("CRED_B64 nchar:", nchar(Sys.getenv("CRED_B64", "")))
+logf("CRED_CSV nchar:", nchar(Sys.getenv("CRED_CSV", "")))
+logf("CRED_PATH:", Sys.getenv("CRED_PATH", ""))
+
+get_credentials <- function() {
+  b64 <- Sys.getenv("CRED_B64", "")
+  if (nzchar(b64)) {
+    logf("Loading credentials from CRED_B64")
+    raw <- base64decode(b64)
+    return(read_csv(raw, show_col_types = FALSE, trim_ws = TRUE))
+  }
+  csv <- Sys.getenv("CRED_CSV", "")
+  if (nzchar(csv)) {
+    logf("Loading credentials from CRED_CSV")
+    con <- textConnection(csv); on.exit(close(con))
+    return(read_csv(con, show_col_types = FALSE, trim_ws = TRUE))
+  }
+  path <- Sys.getenv("CRED_PATH", "")
+  if (nzchar(path)) {
+    logf("Loading credentials from CRED_PATH:", path)
+    stopifnot(file.exists(path))
+    return(read_csv(path, show_col_types = FALSE, trim_ws = TRUE))
+  }
+  stop("No credentials found: set CRED_B64 (preferred), or CRED_CSV, or CRED_PATH")
+}
+
+CRED <- tryCatch(
+  get_credentials(),
+  error = function(e) { logf("Credential load error:", conditionMessage(e)); stop(e) }
+)
+
+# Back-up
+
+# -------------------------
+# Questions (unchanged)
+# -------------------------
+QUESTIONS <- list(
+  HTML("<b>Public Goods & Private Goods</b><br> True, False, or Uncertain: The key difference between <i>public goods</i> and <i>private goods</i> is that all consumers have to pay the same price for public goods, but firms can charge different prices for private goods."),
+  HTML("<b>Actuarial Fairness</b><br> True, False, or Uncertain: If the price of insurance is higher than actuarially fair, individuals should not buy insurance."),
+  HTML("<b>Horizontal Equity</b><br> True, false or uncertain: Exempting tips from income taxes reduces horizontal equity in the tax system."),
+  HTML("<b>Moral Hazard</b><br> Empirical research shows that the duration of unemployment increases as unemployment insurance benefits become more generous. True, false or uncertain: This increase reflects a moral hazard problem."),
+  HTML("<b>Capital Income Tax and Risk</b><br> True, false or uncertain: a capital income tax is a distortion to risk taking."),
+  HTML("<b>Tiebout Choice</b><br> True, False, or Uncertain: The Tiebout model implies that local public goods can be provided efficiently without government intervention. Explain briefly."),
+  HTML("<b>Externalities and Targeting</b><br> The class reading Bento (2014) analyzed a policy that gave HOV lane access to hybrid and electric vehicles with a single occupant. This policy was touted as a free way to reduce air pollution. Explain why this policy is not free."),
+  HTML("<b>Carbon Tax or Solar Panel Subsidies</b><br> If you were advising Governor Hochul on how to address climate change, would you recommend a carbon tax or subsidies for solar panel production? Provide one reason your recommendation is better than the other option."),
+  HTML("<b>Excess Burden</b><br> When energy prices rise, people do not change their energy use (at least in the short term). On the other hand, submitted_at prices of movie tickets go up people go to see movies much less often. A policymaker argues that a tax on energy is therefore more damaging than a tax on movie tickets, because people can mitigate their behavior to reduce their utility loss from the latter. Hence, it is better to tax movie tickets than to tax energy. Do you agree? Explain."),
+  HTML("<b>Tiebout and housing markets</b><br> True, False, or Uncertain: In the Tiebout model, local property taxes serve as a non-distortionary “price” for public goods, so communities with higher demand for public spending will have higher property values and taxes in equilibrium. Explain the link between housing prices, taxes, and sorting.")
+)
+
+title_from_html <- function(x) {
+  s <- as.character(x)
+  t <- stringr::str_extract(s, "(?s)(?<=<b>).+?(?=</b>)")
+  if (is.na(t)) {
+    t <- stringr::str_remove_all(s, "<[^>]+>")
+    t <- stringr::str_squish(t)
+    t <- stringr::str_trunc(t, 120)
+  }
+  t
+}
+
+# -------------------------
+# SQLite connection + schema (HARDENED)
+# -------------------------
+
+# replace app_data_dir() definition with this:
+app_data_dir <- local({
+  dir <- NULL
+  function() {
+    if (!is.null(dir)) return(dir)
+    root <- Sys.getenv("CONNECT_CONTENT_DIR", unset = getwd())
+    if (!nzchar(root)) stop("CONNECT_CONTENT_DIR not set; configure Posit Connect app data.")
+    d <- file.path(root, "data")
+    if (!dir.exists(d)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+    if (!dir.exists(d)) stop(sprintf("Data directory not writable: %s", d))
+    # final write test
+    tf <- file.path(d, ".writetest"); on.exit(unlink(tf, force=TRUE), add=TRUE)
+    if (!isTRUE(try(file.create(tf), silent = TRUE))) {
+      stop(sprintf("Data directory not writable: %s", d))
+    }
+    dir <<- normalizePath(d, winslash = "/", mustWork = TRUE)
+    dir
+  }
 })
+DATA_DIR <- app_data_dir()
+DB_PATH  <- file.path(DATA_DIR, "appdata.sqlite")
+logf(sprintf("DB PATH: %s", DB_PATH))
 
-# Create a tiny pledges table if it doesn't exist
-dbExecute(conn, "
-  CREATE TABLE IF NOT EXISTS pledges (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    amount       REAL,
-    submitted_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
-")
+# Immediately after: logf(sprintf("DB PATH: %s", DB_PATH))
+dir_ok  <- dir.exists(dirname(DB_PATH))
+write_ok <- try(file.create(file.path(dirname(DB_PATH), ".writetest"), showWarnings = FALSE), silent = TRUE)
+unlink(file.path(dirname(DB_PATH), ".writetest"), force = TRUE)
 
 logf(sprintf("DB dir exists: %s; write test: %s",
              dir_ok, if (identical(write_ok, TRUE)) "OK" else "FAIL"))
-
-# --- DB helpers (DRY all DBI:: calls) ---
-new_pool <- function() {
-  pool::dbPool(
-    drv = RSQLite::SQLite(),
-    dbname = DB_PATH,
-    journal_mode = "WAL",         # many readers + few writers
-    busy_timeout = 5000,          # wait up to 5s for locks
-    synchronous = NULL            # <- suppress “couldn't set synchronous” attempts
-    # cache_size = 100000         # optional: ~100MB page cache
-  )
-}
-
-db <- NULL
 
 # Single global connection, no pool
 conn <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
