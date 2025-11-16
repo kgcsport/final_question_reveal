@@ -246,7 +246,8 @@ overwrite_ws <- function(ss, sheet_name, df) {
 google_auth <- function() {
   logf("Initializing Google Sheets authentication...")
   # Check if already authed ---------------------------------------
-  if (!is.null(googledrive::drive_token())) {
+  already_authed <- tryCatch(!is.null(googledrive::drive_token()), error = function(e) FALSE)
+  if (already_authed) {
     logf("Already authenticated — nothing to do")
     return(invisible(TRUE))
   }
