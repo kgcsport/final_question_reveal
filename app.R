@@ -1,7 +1,6 @@
 # app.R
-library(shiny)
-library(future)
-library(promises)
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(shiny, future, promises)
 
 ## ---- Future plan (for async) ----
 # On Posit Connect/Cloud, multisession is fine.
