@@ -105,6 +105,7 @@ app_data_dir <- local({
     dir
   }
 })
+
 DATA_DIR <- app_data_dir()
 DB_PATH  <- file.path(DATA_DIR, "appdata.sqlite")
 logf(sprintf("DB PATH: %s", DB_PATH))
@@ -148,7 +149,6 @@ q_round_tot  <- function(r) db_query("SELECT COALESCE(SUM(pledge),0) AS pledged,
 q_user_round <- function(uid, r) db_query("SELECT COALESCE(pledge,0) AS p
                                            FROM pledges WHERE user_id=? AND round=?;",
                                            list(uid, as.integer(r)))
-
 
 init_db <- function() {
   logf("Creating users table...")
@@ -228,9 +228,7 @@ init_db <- function() {
   })
 }
 
-drive_folder_id <- function() {
-  Sys.getenv("PUB_ECON_FOLDER_ID", "")
-}
+drive_folder_id <- function() Sys.getenv("PUB_ECON_FOLDER_ID", "")
 
 # helper: hard overwrite a single worksheet (drop + recreate)
 overwrite_ws <- function(ss, sheet_name, df) {
@@ -245,7 +243,47 @@ overwrite_ws <- function(ss, sheet_name, df) {
   googlesheets4::range_write(ss, data = df, sheet = sheet_name, range = "A1")
 }
 
+google_auth <- function() {
+
+  # Check if already authed ---------------------------------------
+  if (!is.null(googledrive::drive_token())) {
+    # Already authenticated — nothing to do
+    return(invisible(TRUE))
+  }
+
+  # Get credentials -----------------------------------------------
+  cred <- Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+  if (!nzchar(cred) || !file.exists(cred)) {
+    message("google_auth(): No valid GOOGLE_APPLICATION_CREDENTIALS found.")
+    return(FALSE)
+  }
+
+  # Authenticate googledrive --------------------------------------
+  tryCatch({
+    googledrive::drive_auth(
+      path   = cred,
+      scopes = c(
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/spreadsheets"
+      )
+    )
+
+    # Authenticate googlesheets4 using the same token --------------
+    googlesheets4::gs4_auth(token = googledrive::drive_token())
+
+    message("google_auth(): authenticated successfully.")
+
+    TRUE
+
+  }, error = function(e) {
+    message("google_auth(): FAILED — ", conditionMessage(e))
+    FALSE
+  })
+}
+
 backup_db_to_drive <- function() {
+  google_auth()
   folder_id <- drive_folder_id()
   googledrive::drive_get(googledrive::as_id(folder_id))
 
@@ -453,31 +491,7 @@ restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
 }
 
 init_gs4 <- function() {
-  if (Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS") == "") {
-    json_txt <- Sys.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-    if (nzchar(json_txt)) {
-      tf <- tempfile(fileext = ".json")
-      writeLines(json_txt, tf)
-      Sys.setenv(GOOGLE_APPLICATION_CREDENTIALS = tf)
-    }
-  }
-
-  # Ensure JSON is present (either path was set or we materialized from env)
-  cred <- Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-  stopifnot(nzchar(cred), file.exists(cred))
-
-  googledrive::drive_deauth()
-  googlesheets4::gs4_deauth()
-
-  googledrive::drive_auth(
-    path   = cred,
-    scopes = c(
-      "https://www.googleapis.com/auth/drive",
-      "https://www.googleapis.com/auth/drive.file",
-      "https://www.googleapis.com/auth/spreadsheets"
-    )
-  )
-  googlesheets4::gs4_auth(token = googledrive::drive_token())
+  google_auth()
 
   ss <- Sys.getenv("FINALQ_SHEET_ID", "")
   if (nzchar(ss)) {
