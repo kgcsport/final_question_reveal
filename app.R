@@ -1,6 +1,11 @@
 if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
-pacman::p_load(shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue,googledrive, googlesheets4)  # <-- add googledrive here
+pacman::p_load(
+  shiny, DT, bcrypt, tidyverse, DBI, RSQLite, pool, base64enc, glue, # shiny, encryption, SQL
+  googledrive, googlesheets4, # google drve
+  future, promises  # <-- async tools
+)
 
+future::plan(future::multisession)
 
 `%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(as.character(a))) a else b
 
@@ -350,6 +355,21 @@ backup_db_to_drive <- function() {
   invisible(TRUE)
 }
 
+backup_db_async <- function(label = "async backup") {
+  logf(sprintf("Starting %s (async)...", label))
+
+  promises::future_promise({
+    backup_db_to_drive()
+  }) %...>% (function(ok) {
+    # ok is TRUE/FALSE (invisible) from backup_db_to_drive
+    logf(sprintf("%s completed with result: %s", label, as.character(ok)))
+  }) %...!% (function(e) {
+    logf(sprintf("%s FAILED: %s", label, conditionMessage(e)))
+  }) -> .ignored
+
+  invisible(TRUE)
+}
+
 cached_poll <- function(interval_ms, session, check_sql, value_sql, default_df) {
   cache <- shiny::reactiveVal(default_df)
 
@@ -669,8 +689,6 @@ server <- function(input, output, session) {
   #   try(DBI::dbDisconnect(conn), silent = TRUE)
   # })
 
-  .last_backup_ts <- as.POSIXct(Sys.time() - 3600, tz = "UTC")  # 1 hour ago
-
   # FD + pledge monitor: logs every 5 seconds
   observe({
     invalidateLater(30000, session)
@@ -685,20 +703,28 @@ server <- function(input, output, session) {
   })
 
   onStop(function() {
+    logf("onStop: application is stopping; starting shutdown backup...")
+    # Best-effort synchronous backup — no async here, process is dying
+    try({
+      backup_db_to_drive()
+      logf("onStop: shutdown backup complete.")
+    }, silent = TRUE)
+
     if (!is.null(conn) && DBI::dbIsValid(conn)) {
       try(DBI::dbDisconnect(conn), silent = TRUE)
+      logf("onStop: main DB connection disconnected.")
     }
   })
 
-
-  logf("open connections: %s", length(showConnections(all = TRUE)))
+  
+  .last_backup_ts <- as.POSIXct(Sys.time() - 3600, tz = "UTC")  # 1 hour ago
 
   # ---- Debounced Backup Wrapper1 ----
   backup_trigger <- reactiveVal(NULL)
 
   backup_trigger_debounced <- debounce(backup_trigger, 5000)  # 5 second quiet time
 
-  observeEvent(backup_trigger_debounced(), {
+    observeEvent(backup_trigger_debounced(), {
     now <- Sys.time()
     if (difftime(now, .last_backup_ts, units = "secs") < 60) {
       # Less than 60s since last backup → skip
@@ -708,13 +734,9 @@ server <- function(input, output, session) {
 
     .last_backup_ts <<- now  # update the global timestamp
 
-    logf("Running debounced backup...")
-    tryCatch(
-      backup_db_to_drive(),
-      error = function(e) logf("Debounced backup failed:", e$message)
-    )
+    logf("Running debounced backup (async)...")
+    backup_db_async("debounced backup")
   })
-
 
   rv <- reactiveValues(
     authed = FALSE,
@@ -1529,13 +1551,11 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$backup_now, {
-    ok <- tryCatch(isTRUE(backup_db_to_drive()), error = function(e) { FALSE })
-    if (ok) {
-      showNotification("Backup to Google Sheets: success.", type = "message")
-    } else {
-      showNotification("Backup to Google Sheets: failed (see logs).", type = "error")
-    }
+    showNotification("Backup started in background…", type = "message")
+    backup_db_async("manual backup")
   })
+
+
 
   observeEvent(input$reset_current_round, {
     req(is_admin())
