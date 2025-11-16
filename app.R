@@ -254,9 +254,17 @@ google_auth <- function() {
   # Get credentials -----------------------------------------------
   cred <- Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
   if (!nzchar(cred) || !file.exists(cred)) {
+    json_txt <- Sys.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if (nzchar(json_txt)) {
+      cred <- tempfile(fileext = ".json")
+      writeLines(json_txt, cred)
+    }
+  }
+  if (!nzchar(cred) || !file.exists(cred)) {
     message("google_auth(): No valid GOOGLE_APPLICATION_CREDENTIALS found.")
     return(FALSE)
   }
+  logf(sprintf("GOOGLE_APPLICATION_CREDENTIALS: %s", cred))
 
   # Authenticate googledrive --------------------------------------
   tryCatch({
