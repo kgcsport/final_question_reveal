@@ -115,8 +115,7 @@ dir_ok  <- dir.exists(dirname(DB_PATH))
 write_ok <- try(file.create(file.path(dirname(DB_PATH), ".writetest"), showWarnings = FALSE), silent = TRUE)
 unlink(file.path(dirname(DB_PATH), ".writetest"), force = TRUE)
 
-logf(sprintf("DB dir exists: %s; write test: %s",
-             dir_ok, if (identical(write_ok, TRUE)) "OK" else "FAIL"))
+logf(sprintf("DB dir exists: %s; write test: %s", dir_ok, if (identical(write_ok, TRUE)) "OK" else "FAIL"))
 
 conn <- NULL
 
@@ -292,113 +291,179 @@ google_auth <- function() {
   })
 }
 
+ensure_latest_file_id <- function(folder_id) {
+  files <- googledrive::drive_ls(as_id(folder_id))
+  hit <- files[files$name == "appdata_latest_backup.zip", ]
+
+  if (nrow(hit) == 1) {
+    return(hit$id)
+  } else if (nrow(hit) > 1) {
+    # pick the most recent and delete extras, OR just use the first
+    # but let's just pick the first for now
+    return(hit$id[1])
+  }
+
+  # No file yet — create placeholder
+  tmp <- tempfile()
+  writeLines("", tmp)
+  new_file <- googledrive::drive_upload(
+    media = tmp,
+    path = googledrive::as_id(folder_id),
+    name = "appdata_latest_backup.zip"
+  )
+  new_file$id
+}
+
 backup_db_to_drive <- function() {
-  google_auth()
+  logf("Backup: starting...")
+
+  # ---- Google auth ----
+  if (!google_auth()) {
+    logf("Backup aborted: could not authenticate to Google.")
+    return(invisible(FALSE))
+  }
+
+  # ---- Drive folder sanity check ----
   folder_id <- drive_folder_id()
   googledrive::drive_get(googledrive::as_id(folder_id))
 
-  con <- get_con()
-  try(DBI::dbExecute(con, "PRAGMA wal_checkpoint(FULL);"), silent = TRUE)
-  # do NOT dbDisconnect() here; keep conn open
+  # ---- Open a fresh DB connection (NO get_con/db_query here) ----
+  if (!"DBI" %in% loadedNamespaces())  requireNamespace("DBI")
+  if (!"RSQLite" %in% loadedNamespaces()) requireNamespace("RSQLite")
 
-  files <- c(DB_PATH,
-             paste0(DB_PATH, "-wal"),
-             paste0(DB_PATH, "-shm"))
+  con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+  on.exit({
+    try(DBI::dbDisconnect(con), silent = TRUE)
+  }, add = TRUE)
+
+  try(DBI::dbExecute(con, "PRAGMA wal_checkpoint(FULL);"), silent = TRUE)
+
+  # ---- Zip SQLite files ----
+  files <- c(DB_PATH, paste0(DB_PATH, "-wal"), paste0(DB_PATH, "-shm"))
   files <- files[file.exists(files)]
 
-  zipfile <- file.path(tempdir(), sprintf("appdata_%s.zip",
-                     format(Sys.time(), "%Y%m%d_%H%M%S")))
+  zipfile <- file.path(
+    tempdir(),
+    sprintf("appdata_%s.zip", format(Sys.time(), "%Y%m%d_%H%M%S"))
+  )
   utils::zip(zipfile, files = files, flags = "-j")
-  # also make one called "latest" that is a copy of the dated one
-  file.copy(zipfile, file.path(tempdir(), "appdata_latest_backup.zip"))
 
-  # Upload to Drive folder
+  latest_zip <- file.path(tempdir(), "appdata_latest_backup.zip")
+  file.copy(zipfile, latest_zip, overwrite = TRUE)
+
+  # ---- Upload zips ----
   nm <- basename(zipfile)
-  googledrive::drive_upload(media = zipfile,
-                            path  = googledrive::as_id(folder_id),
-                            name  = nm,
-                            type  = "application/zip",
-                            overwrite = FALSE)
 
-  googledrive::drive_upload(media = file.path(tempdir(), "appdata_latest_backup.zip"),
-                            path  = googledrive::as_id(folder_id),
-                            name  = "appdata_latest_backup.zip",
-                            type  = "application/zip",
-                            overwrite = TRUE)
+  googledrive::drive_upload(
+    media     = zipfile,
+    path      = googledrive::as_id(folder_id),
+    name      = nm,
+    type      = "application/zip",
+    overwrite = FALSE
+  )
+
+  googledrive::drive_upload(
+    media     = latest_zip,
+    path      = googledrive::as_id(folder_id),
+    name      = "appdata_latest_backup.zip",
+    type      = "application/zip",
+    overwrite = TRUE
+  )
 
   logf(sprintf("DB backup uploaded: %s", nm))
 
+  # ---- Sheets backup ----
   ss_id <- Sys.getenv("FINALQ_SHEET_ID", "")
   if (!nzchar(ss_id)) {
     logf("Backup skipped: FINALQ_SHEET_ID not set")
     return(invisible(FALSE))
   }
 
-  # --- pull data from DB (defensive: never leave these undefined) ---
   det <- tryCatch(
-    db_query("SELECT * FROM pledges ORDER BY COALESCE(submitted_at, '')"),
-    error = function(e) { logf(paste("backup: pledges query failed:", e$message)); NULL }
+    DBI::dbGetQuery(con, "SELECT * FROM pledges ORDER BY COALESCE(submitted_at, '')"),
+    error = function(e) {
+      logf(paste("backup: pledges query failed:", e$message))
+      NULL
+    }
   )
 
   summ <- tryCatch(
-    db_query("
+    DBI::dbGetQuery(con, "
       SELECT
         round,
-        COUNT(*)                         AS n_pledges,
-        COUNT(DISTINCT user_id)             AS n_users,
-        ROUND(SUM(COALESCE(pledge,0)),2) AS total_points,
-        ROUND(SUM(COALESCE(charged,0)),2) AS total_charged
+        COUNT(*)                              AS n_pledges,
+        COUNT(DISTINCT user_id)              AS n_users,
+        ROUND(SUM(COALESCE(pledge,0)),2)     AS total_points,
+        ROUND(SUM(COALESCE(charged,0)),2)    AS total_charged
       FROM pledges
       GROUP BY 1
       ORDER BY 1
     "),
-    error = function(e) { logf(paste("backup: summary query failed:", e$message)); NULL }
+    error = function(e) {
+      logf(paste("backup: summary query failed:", e$message))
+      NULL
+    }
   )
 
   gsnap <- tryCatch(
-    db_query("
+    DBI::dbGetQuery(con, "
       SELECT id, round, round_open, carryover, unlocked_units,
              scale_factor, question_text, started_at, updated_at
       FROM game_state WHERE id = 1
     "),
-    error = function(e) { logf(paste("backup: game_state snapshot failed:", e$message)); NULL }
+    error = function(e) {
+      logf(paste("backup: game_state snapshot failed:", e$message))
+      NULL
+    }
   )
 
-  # If there are literally no pledges yet, you can either skip or write empty tabs.
   if (is.null(det) || nrow(det) == 0) {
     logf("Backup skipped: no pledges found.")
     return(invisible(FALSE))
   }
 
-  # --- ensure tabs exist, then write ---
-  tabs <- tryCatch(googlesheets4::sheet_names(ss_id), error = function(e) character(0))
+  tabs <- tryCatch(
+    googlesheets4::sheet_names(ss_id),
+    error = function(e) {
+      logf(paste("backup: sheet_names failed:", e$message))
+      character(0)
+    }
+  )
 
-  if (!"pledges" %in% tabs)        googlesheets4::sheet_add(ss_id, "pledges")
-  if (!"round_summary" %in% tabs)  googlesheets4::sheet_add(ss_id, "round_summary")
-  if (!is.null(gsnap) && nrow(gsnap) > 0 && !"game_state_snapshot" %in% tabs)
+  if (!"pledges" %in% tabs)       googlesheets4::sheet_add(ss_id, "pledges")
+  if (!"round_summary" %in% tabs) googlesheets4::sheet_add(ss_id, "round_summary")
+  if (!is.null(gsnap) && nrow(gsnap) > 0 && !"game_state_snapshot" %in% tabs) {
     googlesheets4::sheet_add(ss_id, "game_state_snapshot")
+  }
 
-  # Write pledges (hard overwrite)
   overwrite_ws(ss_id, "pledges", det)
 
-  # Write round summary (even if empty; ensure it has columns)
   if (is.null(summ) || !is.data.frame(summ)) {
-    summ <- tibble::tibble(round = integer(), n_pledges = integer(),
-                          n_users = integer(), total_points = numeric(),
-                          total_charged = numeric())
+    summ <- tibble::tibble(
+      round         = integer(),
+      n_pledges     = integer(),
+      n_users       = integer(),
+      total_points  = numeric(),
+      total_charged = numeric()
+    )
   }
   overwrite_ws(ss_id, "round_summary", summ)
 
-  # Write game_state snapshot (only if we have exactly one row)
   if (!is.null(gsnap) && nrow(gsnap) == 1) {
     overwrite_ws(ss_id, "game_state_snapshot", gsnap)
   } else {
-    logf("backup: no valid game_state snapshot to write (nrow=%s)", if (is.null(gsnap)) NA else nrow(gsnap))
+    logf(
+      "backup: no valid game_state snapshot to write (nrow=%s)",
+      if (is.null(gsnap)) NA_integer_ else nrow(gsnap)
+    )
   }
 
-  logf("Backup complete: pledges=%s rows; summary rows=%s; snapshot rows=%s",
-       nrow(det), if (is.null(summ)) 0 else nrow(summ), if (is.null(gsnap)) 0 else nrow(gsnap))
-  invisible(TRUE)
+  logf(
+    "Backup complete: pledges=%s rows; summary rows=%s; snapshot rows=%s",
+    nrow(det),
+    if (is.null(summ)) 0L else nrow(summ),
+    if (is.null(gsnap)) 0L else nrow(gsnap)
+  )
 
   invisible(TRUE)
 }
@@ -751,7 +816,7 @@ server <- function(input, output, session) {
     observeEvent(backup_trigger_debounced(), {
     now <- Sys.time()
     if (difftime(now, .last_backup_ts, units = "secs") < 60) {
-      # Less than 60s since last backup → skip
+      # Less than 60s since last backup -> skip
       logf("Skipping backup: last backup was too recent.")
       return()
     }
