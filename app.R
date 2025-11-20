@@ -315,11 +315,11 @@ ensure_latest_file_id <- function(folder_id) {
 }
 
 backup_db_to_drive <- function() {
-  logf("Backup: starting...")
+  logf("Backup (zip) starting...")
 
-  # ---- Google auth ----
+  # ---- Google auth (needed for Drive uploads) ----
   if (!google_auth()) {
-    logf("Backup aborted: could not authenticate to Google.")
+    logf("Zip backup aborted: could not authenticate to Google.")
     return(invisible(FALSE))
   }
 
@@ -327,7 +327,7 @@ backup_db_to_drive <- function() {
   folder_id <- drive_folder_id()
   googledrive::drive_get(googledrive::as_id(folder_id))
 
-  # ---- Open a fresh DB connection (NO get_con/db_query here) ----
+  # ---- Open a fresh DB connection just to checkpoint WAL ----
   if (!"DBI" %in% loadedNamespaces())  requireNamespace("DBI")
   if (!"RSQLite" %in% loadedNamespaces()) requireNamespace("RSQLite")
 
@@ -336,10 +336,13 @@ backup_db_to_drive <- function() {
     try(DBI::dbDisconnect(con), silent = TRUE)
   }, add = TRUE)
 
+  # Best-effort WAL checkpoint
   try(DBI::dbExecute(con, "PRAGMA wal_checkpoint(FULL);"), silent = TRUE)
 
   # ---- Zip SQLite files ----
-  files <- c(DB_PATH, paste0(DB_PATH, "-wal"), paste0(DB_PATH, "-shm"))
+  files <- c(DB_PATH,
+             paste0(DB_PATH, "-wal"),
+             paste0(DB_PATH, "-shm"))
   files <- files[file.exists(files)]
 
   zipfile <- file.path(
@@ -351,7 +354,7 @@ backup_db_to_drive <- function() {
   latest_zip <- file.path(tempdir(), "appdata_latest_backup.zip")
   file.copy(zipfile, latest_zip, overwrite = TRUE)
 
-  # ---- Upload zips ----
+  # ---- Upload zips to Drive ----
   nm <- basename(zipfile)
 
   googledrive::drive_upload(
@@ -370,15 +373,35 @@ backup_db_to_drive <- function() {
     overwrite = TRUE
   )
 
-  logf(sprintf("DB backup uploaded: %s", nm))
+  logf(sprintf("DB zip backup uploaded: %s", nm))
+  invisible(TRUE)
+}
 
-  # ---- Sheets backup ----
-  ss_id <- Sys.getenv("FINALQ_SHEET_ID", "")
-  if (!nzchar(ss_id)) {
-    logf("Backup skipped: FINALQ_SHEET_ID not set")
+backup_db_to_sheets <- function() {
+  logf("Sheets backup: starting...")
+
+  # ---- Google auth ----
+  if (!google_auth()) {
+    logf("Sheets backup aborted: could not authenticate to Google.")
     return(invisible(FALSE))
   }
 
+  ss_id <- Sys.getenv("FINALQ_SHEET_ID", "")
+  if (!nzchar(ss_id)) {
+    logf("Sheets backup skipped: FINALQ_SHEET_ID not set")
+    return(invisible(FALSE))
+  }
+
+  # ---- Open a fresh DB connection ----
+  if (!"DBI" %in% loadedNamespaces())  requireNamespace("DBI")
+  if (!"RSQLite" %in% loadedNamespaces()) requireNamespace("RSQLite")
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+  on.exit({
+    try(DBI::dbDisconnect(con), silent = TRUE)
+  }, add = TRUE)
+
+  # ---- Pull data from DB ----
   det <- tryCatch(
     DBI::dbGetQuery(con, "SELECT * FROM pledges ORDER BY COALESCE(submitted_at, '')"),
     error = function(e) {
@@ -391,10 +414,10 @@ backup_db_to_drive <- function() {
     DBI::dbGetQuery(con, "
       SELECT
         round,
-        COUNT(*)                              AS n_pledges,
-        COUNT(DISTINCT user_id)              AS n_users,
-        ROUND(SUM(COALESCE(pledge,0)),2)     AS total_points,
-        ROUND(SUM(COALESCE(charged,0)),2)    AS total_charged
+        COUNT(*)                          AS n_pledges,
+        COUNT(DISTINCT user_id)           AS n_users,
+        ROUND(SUM(COALESCE(pledge,0)),2)  AS total_points,
+        ROUND(SUM(COALESCE(charged,0)),2) AS total_charged
       FROM pledges
       GROUP BY 1
       ORDER BY 1
@@ -418,10 +441,11 @@ backup_db_to_drive <- function() {
   )
 
   if (is.null(det) || nrow(det) == 0) {
-    logf("Backup skipped: no pledges found.")
+    logf("Sheets backup skipped: no pledges found.")
     return(invisible(FALSE))
   }
 
+  # ---- Ensure tabs exist ----
   tabs <- tryCatch(
     googlesheets4::sheet_names(ss_id),
     error = function(e) {
@@ -436,6 +460,7 @@ backup_db_to_drive <- function() {
     googlesheets4::sheet_add(ss_id, "game_state_snapshot")
   }
 
+  # ---- Write data to sheets ----
   overwrite_ws(ss_id, "pledges", det)
 
   if (is.null(summ) || !is.data.frame(summ)) {
@@ -459,7 +484,7 @@ backup_db_to_drive <- function() {
   }
 
   logf(
-    "Backup complete: pledges=%s rows; summary rows=%s; snapshot rows=%s",
+    "Sheets backup complete: pledges=%s rows; summary rows=%s; snapshot rows=%s",
     nrow(det),
     if (is.null(summ)) 0L else nrow(summ),
     if (is.null(gsnap)) 0L else nrow(gsnap)
@@ -468,17 +493,59 @@ backup_db_to_drive <- function() {
   invisible(TRUE)
 }
 
-backup_db_async <- function(label = "async backup") {
+backup_db_async <- function(label = "async backup", sheets = FALSE) {
   logf(sprintf("Starting %s (async)...", label))
 
   promises::future_promise({
-    backup_db_to_drive()
-  }) %...>% (function(ok) {
-    # ok is TRUE/FALSE (invisible) from backup_db_to_drive
-    logf(sprintf("%s completed with result: %s", label, as.character(ok)))
+    # This code runs in the future worker
+    res <- list(ok_drive = NA, ok_sheets = NA)
+
+    # 1) Zip-to-Drive backup
+    res$ok_drive <- tryCatch({
+      backup_db_to_drive()
+      TRUE
+    }, error = function(e) {
+      logf(sprintf("%s: zip backup FAILED inside future: %s",
+                   label, conditionMessage(e)))
+      FALSE
+    })
+
+    # 2) Optional Sheets backup (manual-only)
+    if (isTRUE(sheets)) {
+      res$ok_sheets <- tryCatch({
+        backup_db_to_sheets()
+        TRUE
+      }, error = function(e) {
+        logf(sprintf("%s: sheets backup FAILED inside future: %s",
+                     label, conditionMessage(e)))
+        FALSE
+      })
+    } else {
+      res$ok_sheets <- NA  # not attempted
+    }
+
+    res
+  }) %...>% (function(result) {
+    # This runs back in the main R process when the future resolves
+    if (is.null(result) || !is.list(result)) {
+      logf(sprintf(
+        "%s completed, but result was unexpected type: %s",
+        label, paste(class(result), collapse = ", ")
+      ))
+    } else {
+      logf(sprintf(
+        "%s completed: zip=%s, sheets=%s",
+        label,
+        as.character(result$ok_drive),
+        as.character(result$ok_sheets)
+      ))
+    }
+    invisible(NULL)
   }) %...!% (function(e) {
-    logf(sprintf("%s FAILED: %s", label, conditionMessage(e)))
-  }) -> .ignored
+    # This catches failures of the future itself (e.g. worker crash)
+    logf(sprintf("%s FAILED at future level: %s",
+                 label, conditionMessage(e)))
+  }) -> .ignored   # keep the promise object out of the global env
 
   invisible(TRUE)
 }
@@ -1674,9 +1741,8 @@ server <- function(input, output, session) {
 
   observeEvent(input$backup_now, {
     showNotification("Backup started in background…", type = "message")
-    backup_db_async("manual backup")
+    backup_db_async("manual backup",sheets=TRUE)
   })
-
 
 
   observeEvent(input$reset_current_round, {
