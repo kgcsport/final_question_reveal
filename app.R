@@ -524,6 +524,33 @@ recompute_state_from_pledges <- function(cost) {
   list(unlocked = unlocked_total, carry = carry)
 }
 
+db_hash <- function() {
+  # Hash DB file + WAL + SHM if present
+  parts <- c(DB_PATH,
+             paste0(DB_PATH, "-wal"),
+             paste0(DB_PATH, "-shm"))
+
+  parts <- parts[file.exists(parts)]
+
+  raw <- unlist(lapply(parts, readBin, what="raw", n=file.info(parts)$size))
+
+  digest::digest(raw, algo="xxhash64")
+}
+
+db_changed_since_last_backup <- function() {
+  new_hash <- db_hash()
+  same <- identical(new_hash, .last_db_hash)
+  if (same) {
+    FALSE
+  } else {
+    if (is.null(.last_db_hash)) {
+      logf("db_changed_since_last_backup(): initializing hash")
+    }
+    .last_db_hash <<- new_hash
+    TRUE
+  }
+}
+
 restore_db_from_drive <- function(filename = "appdata_latest_backup.zip") {
   folder_id <- drive_folder_id()
   googledrive::drive_get(googledrive::as_id(folder_id))
@@ -602,6 +629,7 @@ logf(paste("gs4 auth user:", tryCatch(googlesheets4::gs4_user()$email, error=fun
 
 logf("Initializing database...")
 init_db()
+.last_db_hash <- db_hash()
 logf("Database initialized.")
 
 # OK to omit entirely on Connect; if you keep it:
@@ -792,12 +820,18 @@ server <- function(input, output, session) {
   })
 
   onStop(function() {
-    logf("onStop: application is stopping; starting shutdown backup...")
-    # Best-effort synchronous backup — no async here, process is dying
-    try({
-      backup_db_to_drive()
+    logf("onStop: application is stopping...")
+
+    if (db_changed_since_last_backup()) {
+      logf("onStop: unbacked DB changes detected; running shutdown backup...")
+      try({
+        backup_db_to_drive()
+        .last_backup_ts <<- Sys.time()
+      }, silent = TRUE)
       logf("onStop: shutdown backup complete.")
-    }, silent = TRUE)
+    } else {
+      logf("onStop: DB unchanged; skipping shutdown backup.")
+    }
 
     if (!is.null(conn) && DBI::dbIsValid(conn)) {
       try(DBI::dbDisconnect(conn), silent = TRUE)
@@ -815,14 +849,13 @@ server <- function(input, output, session) {
 
     observeEvent(backup_trigger_debounced(), {
     now <- Sys.time()
-    if (difftime(now, .last_backup_ts, units = "secs") < 60) {
-      # Less than 60s since last backup -> skip
-      logf("Skipping backup: last backup was too recent.")
+
+    if (!db_changed_since_last_backup()) {
+      logf("Skipping backup: database unchanged.")
       return()
     }
 
-    .last_backup_ts <<- now  # update the global timestamp
-
+    .last_backup_ts <<- now
     logf("Running debounced backup (async)...")
     backup_db_async("debounced backup")
   })
@@ -972,10 +1005,10 @@ server <- function(input, output, session) {
         <li>Each student starts with <b>%g points</b> they can pledge toward unlocking potential final exam questions.</li>
         <li>Each potential question costs <b>%g total points</b>. The class is paying collectively. If the class can afford one or more questions in a round (including leftover points carried in from previous rounds), those questions are unlocked.</li>
         <li>The first question unlocked is 100 percent likely to appear on the exam. The Qth additional question will appear with probability 1/Q where Q is the number of unlocked questions so far.</li>
-        <li>You are only actually charged for the share of your pledge that is needed to buy the question(s). If the class over-pledges in a round, everyone is scaled down proportionally so that nobody overpays.</li>
+        <li>Each class, I will close the pledging to see if the class has pledged enough points to unlock a question. If the class has pledged enough points, I will reveal the question to the class and move onto the next round. If the class has not pledged enough points, I will reopen the round.</li>
         <li>Any extra points that were pledged but not needed roll forward as carryover to help fund the next round.</li>
         <li>Your pledge limit shrinks after you spend. In later rounds you can only pledge points you have not already pledged in earlier rounds.</li>
-        <li>If, at the end of a round, the class doesn’t have enough (carryover + new pledges) to afford even one new question, nobody is charged for that round and no additional question is unlocked.</li>
+        <li>If, at the end of the course, the class doesn’t have enough (carryover + new pledges) to afford even one new question, nobody is charged for that round and no additional question is unlocked.</li>
       </ol>",
       s$max_per_student, s$cost
     ))
