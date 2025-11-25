@@ -971,14 +971,14 @@ server <- function(input, output, session) {
 
     # --- Log ---
     logf(
-      "FD snapshot:\n%s\nOpen files: %s | CPU: %s ticks (~%s s @ %s MHz) | RAM usage: %s kB | DB size: %s MB",
+      sprintf("FD snapshot:\n%s\nOpen files: %s | CPU: %s ticks (~%s s @ %s MHz) | RAM usage: %s kB | DB size: %s MB",
       paste(utils::capture.output(tail(df, 1)), collapse = "\n"),
       nrow(df),
       cpu_ticks_str,
       cpu_secs_str,
       cpu_mhz_str,
       ram_str,
-      db_size_str
+      db_size_str)
     )
   })
 
