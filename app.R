@@ -873,7 +873,7 @@ server <- function(input, output, session) {
   #   try(DBI::dbDisconnect(conn), silent = TRUE)
   # })
 
-  # FD + pledge monitor: logs every 5 seconds
+  # FD + pledge monitor: logs every 30000 milliseconds (30 seconds)
   observe({
     invalidateLater(30000, session)
     files <- list.files("/proc/self/fd", full.names = TRUE)
@@ -882,8 +882,49 @@ server <- function(input, output, session) {
     })
     df <- data.frame(fd = basename(files), target = targets, stringsAsFactors = FALSE)
 
-    # Just log the last 10 descriptors
-    logf("FD snapshot:\n%s and has %s open files", paste(utils::capture.output(tail(df, 1)), collapse = "\n"), nrow(df))
+    # Get resource usage (CPU and RAM)
+    # We attempt to read from /proc/self/stat for CPU (utime+stime) and /proc/self/status for RAM (VmRSS)
+    cpu_usage <- NA
+    ram_usage <- NA
+
+    # Get CPU usage (user + sys time in clock ticks)
+    stat_file <- "/proc/self/stat"
+    if (file.exists(stat_file)) {
+      stat <- tryCatch(scan(stat_file, what = "", quiet = TRUE), error = function(e) NULL)
+      if (!is.null(stat) && length(stat) > 15) {
+        # According to proc(5), 14=utime, 15=stime (1-based)
+        utime <- as.numeric(stat[14])
+        stime <- as.numeric(stat[15])
+        cpu_usage <- utime + stime
+      }
+    }
+
+    # Get RAM usage (resident set size in kB)
+    status_file <- "/proc/self/status"
+    gc(full = TRUE)
+    if (file.exists(status_file)) {
+      status_lines <- tryCatch(readLines(status_file, warn = FALSE), error = function(e) NULL)
+      if (!is.null(status_lines)) {
+        vmrss_line <- grep("^VmRSS:", status_lines, value = TRUE)
+        if (length(vmrss_line) > 0) {
+          ram_usage <- gsub("VmRSS:\\s*([0-9]+) kB.*", "\\1", vmrss_line[1])
+          ram_usage <- as.numeric(ram_usage)
+        }
+      }
+    }
+
+    # get size of sqlite database
+    db_size <- file.size(DB_PATH)
+    db_size <- db_size / 1024 / 1024 # convert to MB
+
+    logf(
+      "FD snapshot:\n%s\nOpen files: %s | CPU usage: %s (clock ticks) | RAM usage: %s kB | DB size: %s MB",
+      paste(utils::capture.output(tail(df, 1)), collapse = "\n"),
+      nrow(df),
+      ifelse(is.na(cpu_usage), "N/A", cpu_usage),
+      ifelse(is.na(ram_usage), "N/A", ram_usage),
+      ifelse(is.na(db_size), "N/A", db_size)
+    )
   })
 
   onStop(function() {
