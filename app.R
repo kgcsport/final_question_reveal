@@ -10,7 +10,25 @@ future::plan(future::multisession)
 `%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(as.character(a))) a else b
 
 # Log helper: writes to stderr (shows in Connect logs)
-logf <- function(...) cat(format(Sys.time()), "-", paste(..., collapse=" "), "\n", file=stderr())
+logf <- function(...) {
+  ts <- format(Sys.time())
+  args <- list(...)
+
+  # Convert each argument to a single string without smashing multiline content
+  parts <- vapply(args, function(x) {
+    if (length(x) > 1) {
+      paste(x, collapse = "\n")  # preserve newlines
+    } else {
+      as.character(x)
+    }
+  }, FUN.VALUE = character(1))
+
+  msg <- paste(parts, collapse = " ")
+
+  cat(ts, "-", msg, "\n", file = stderr())
+  flush(stderr())
+}
+
 
 options(shiny.sanitize.errors = FALSE)
 options(shiny.fullstacktrace = TRUE)
@@ -876,18 +894,17 @@ server <- function(input, output, session) {
   # FD + pledge monitor: logs every 30000 milliseconds (30 seconds)
   observe({
     invalidateLater(30000, session)
+
+    # --- Open file descriptors ---
     files <- list.files("/proc/self/fd", full.names = TRUE)
     targets <- sapply(files, function(f) {
       tryCatch(readlink(f), error = function(e) NA_character_)
     })
     df <- data.frame(fd = basename(files), target = targets, stringsAsFactors = FALSE)
 
-    # Get resource usage (CPU and RAM)
-    # We attempt to read from /proc/self/stat for CPU (utime+stime) and /proc/self/status for RAM (VmRSS)
-    cpu_usage <- NA
-    ram_usage <- NA
+    # --- CPU usage (ticks) ---
+    cpu_usage <- NA_real_
 
-    # Get CPU usage (user + sys time in clock ticks)
     stat_file <- "/proc/self/stat"
     if (file.exists(stat_file)) {
       stat <- tryCatch(scan(stat_file, what = "", quiet = TRUE), error = function(e) NULL)
@@ -895,11 +912,37 @@ server <- function(input, output, session) {
         # According to proc(5), 14=utime, 15=stime (1-based)
         utime <- as.numeric(stat[14])
         stime <- as.numeric(stat[15])
-        cpu_usage <- utime + stime
+        cpu_usage <- utime + stime  # total ticks
       }
     }
 
-    # Get RAM usage (resident set size in kB)
+    # Convert ticks -> seconds using system HZ (CLK_TCK)
+    ticks_per_second <- suppressWarnings(
+      as.numeric(system("getconf CLK_TCK", intern = TRUE))
+    )
+    if (is.na(ticks_per_second) || ticks_per_second <= 0) {
+      ticks_per_second <- 100  # sensible fallback
+    }
+    cpu_seconds <- if (!is.na(cpu_usage)) cpu_usage / ticks_per_second else NA_real_
+
+    # --- CPU MHz (from /proc/cpuinfo) ---
+    cpu_mhz <- NA_real_
+    cpuinfo_file <- "/proc/cpuinfo"
+    if (file.exists(cpuinfo_file)) {
+      cpuinfo <- tryCatch(readLines(cpuinfo_file, warn = FALSE), error = function(e) NULL)
+      if (!is.null(cpuinfo)) {
+        mhz_lines <- grep("MHz", cpuinfo, value = TRUE)
+        if (length(mhz_lines) > 0) {
+          # take the first core's MHz
+          cpu_mhz <- suppressWarnings(
+            as.numeric(sub(".*:\\s*", "", mhz_lines[1]))
+          )
+        }
+      }
+    }
+
+    # --- RAM usage (VmRSS, kB) ---
+    ram_usage <- NA_real_
     status_file <- "/proc/self/status"
     gc(full = TRUE)
     if (file.exists(status_file)) {
@@ -913,19 +956,32 @@ server <- function(input, output, session) {
       }
     }
 
-    # get size of sqlite database
-    db_size <- file.size(DB_PATH)
-    db_size <- db_size / 1024 / 1024 # convert to MB
+    # --- SQLite DB size (MB) ---
+    db_size <- suppressWarnings(file.size(DB_PATH))
+    if (!is.na(db_size)) {
+      db_size <- db_size / 1024 / 1024  # bytes -> MB
+    }
 
+    # --- Pretty strings for logging ---
+    cpu_ticks_str   <- ifelse(is.na(cpu_usage), "N/A", sprintf("%.0f", cpu_usage))
+    cpu_secs_str    <- ifelse(is.na(cpu_seconds), "N/A", sprintf("%.2f", cpu_seconds))
+    cpu_mhz_str     <- ifelse(is.na(cpu_mhz), "N/A", sprintf("%.0f", cpu_mhz))
+    ram_str         <- ifelse(is.na(ram_usage), "N/A", sprintf("%.0f", ram_usage))
+    db_size_str     <- ifelse(is.na(db_size), "N/A", sprintf("%.3f", db_size))
+
+    # --- Log ---
     logf(
-      "FD snapshot:\n%s\nOpen files: %s | CPU usage: %s (clock ticks) | RAM usage: %s kB | DB size: %s MB",
+      "FD snapshot:\n%s\nOpen files: %s | CPU: %s ticks (~%s s @ %s MHz) | RAM usage: %s kB | DB size: %s MB",
       paste(utils::capture.output(tail(df, 1)), collapse = "\n"),
       nrow(df),
-      ifelse(is.na(cpu_usage), "N/A", cpu_usage),
-      ifelse(is.na(ram_usage), "N/A", ram_usage),
-      ifelse(is.na(db_size), "N/A", db_size)
+      cpu_ticks_str,
+      cpu_secs_str,
+      cpu_mhz_str,
+      ram_str,
+      db_size_str
     )
   })
+
 
   onStop(function() {
     logf("onStop: application is stopping...")
